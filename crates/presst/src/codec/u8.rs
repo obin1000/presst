@@ -212,6 +212,9 @@ pub(crate) struct U8Decoder {
     sym: [u64; 256],
     /// Symbol length per code; 0 for codes that are not in the dictionary.
     len: [u8; 256],
+    /// Whether every non-escape code is a symbol (255 symbols). Then no code
+    /// can be invalid and the hot loop skips the check.
+    full: bool,
 }
 
 impl U8Decoder {
@@ -222,7 +225,11 @@ impl U8Decoder {
             sym[code] = pack_le(s);
             len[code] = s.len() as u8;
         }
-        Self { sym, len }
+        Self {
+            sym,
+            len,
+            full: dict.len() == crate::scheme::U8_MAX_SYMBOLS,
+        }
     }
 
     /// Decodes `codes`, appending at most `limit` bytes to `out`. Returns the
@@ -231,10 +238,22 @@ impl U8Decoder {
     /// Never panics or writes out of bounds on malformed input: invalid codes,
     /// truncated escapes and output larger than `limit` are reported as errors.
     pub(crate) fn decode(&self, codes: &[u8], out: &mut Vec<u8>, limit: usize) -> Result<usize> {
-        // 8 bytes of slack let every symbol be written with one 8-byte store.
-        out.reserve(limit.checked_add(8).ok_or(Error::Corrupt("output size overflow"))?);
+        if self.full {
+            self.decode_impl::<false>(codes, out, limit)
+        } else {
+            self.decode_impl::<true>(codes, out, limit)
+        }
+    }
+
+    /// `CHECK` enables invalid-code tracking in the fast path. It is only
+    /// disabled for full dictionaries, where every code is valid.
+    #[inline(always)]
+    fn decode_impl<const CHECK: bool>(&self, codes: &[u8], out: &mut Vec<u8>, limit: usize) -> Result<usize> {
+        // Slack after `limit` lets every symbol be written with one 8-byte
+        // store and lets the fast path run until the very end of the output.
+        out.reserve(limit.checked_add(SLACK).ok_or(Error::Corrupt("output size overflow"))?);
         let start = out.len();
-        // SAFETY: reserve() guarantees capacity >= start + limit + 8.
+        // SAFETY: reserve() guarantees capacity >= start + limit + SLACK.
         let base = unsafe { out.as_mut_ptr().add(start) };
         let n = codes.len();
         let mut ip = 0;
@@ -242,25 +261,59 @@ impl U8Decoder {
         let mut invalid = 0u8;
 
         loop {
-            // Fast path: four codes per iteration, no escapes, and room for
-            // four unconditional 8-byte stores.
-            while ip + 4 <= n && op + 32 <= limit {
-                // SAFETY: ip + 4 <= n.
-                let word = u32::from_le(unsafe { codes.as_ptr().add(ip).cast::<u32>().read_unaligned() });
-                if has_escape(word) {
-                    break;
+            // Fast path: eight codes per iteration with room for eight
+            // unconditional 8-byte stores. An escape ends the batch early: the
+            // codes before it are decoded, then the literal, all inline.
+            while ip + 8 <= n && op <= limit {
+                // SAFETY: ip + 8 <= n.
+                let word = u64::from_le(unsafe { codes.as_ptr().add(ip).cast::<u64>().read_unaligned() });
+                let esc = escape_mask(word);
+                if esc == 0 {
+                    // Common case, kept separate so the loop is fully unrolled.
+                    for k in 0..8 {
+                        let c = ((word >> (8 * k)) & 0xFF) as usize;
+                        let l = self.len[c] as usize;
+                        // SAFETY: as below, eight stores of 8 bytes starting
+                        // at op <= limit end by limit + 64 <= limit + SLACK.
+                        unsafe { base.add(op).cast::<u64>().write_unaligned(self.sym[c].to_le()) };
+                        if CHECK {
+                            invalid |= (l == 0) as u8;
+                        }
+                        op += l;
+                    }
+                    ip += 8;
+                    continue;
                 }
-                for k in 0..4 {
+                // Number of codes before the first escape. The lowest set bit
+                // of the mask is exact (see `escape_mask`).
+                let plain = (esc.trailing_zeros() / 8) as usize;
+                for k in 0..plain {
                     let c = ((word >> (8 * k)) & 0xFF) as usize;
                     let l = self.len[c] as usize;
-                    // SAFETY: before the 4 codes op + 32 <= limit and each code
-                    // writes 8 bytes at op and advances op by at most 8, so all
-                    // stores end at or before limit + 8 <= reserved capacity.
+                    // SAFETY: before the batch op <= limit; each code writes 8
+                    // bytes at op and advances op by at most 8, so all stores
+                    // end by limit + 64 <= limit + SLACK (reserved capacity).
                     unsafe { base.add(op).cast::<u64>().write_unaligned(self.sym[c].to_le()) };
-                    invalid |= (l == 0) as u8;
+                    if CHECK {
+                        invalid |= (l == 0) as u8;
+                    }
                     op += l;
                 }
-                ip += 4;
+                // Escape at ip + plain; its literal follows.
+                let Some(&lit) = codes.get(ip + plain + 1) else {
+                    ip += plain;
+                    break; // the slow path reports the truncated escape
+                };
+                // SAFETY: at most 7 codes (56 bytes) were written since the
+                // check op <= limit, so op + 1 <= limit + 57 <= limit + SLACK.
+                unsafe { base.add(op).write(lit) };
+                op += 1;
+                ip += plain + 2;
+            }
+            // The fast path may run past `limit` (into the slack) on corrupt
+            // input; stop there instead of decoding further.
+            if op > limit {
+                return Err(Error::Corrupt("decoded data is larger than expected"));
             }
             if ip >= n {
                 break;
@@ -300,11 +353,19 @@ impl U8Decoder {
     }
 }
 
-/// Whether any byte of `word` is the escape code 0xFF.
+/// Bytes reserved after the expected output: 8 codes of 8 bytes each.
+const SLACK: usize = 64;
+
+/// Sets bit 7 of every byte of `word` that is the escape code 0xFF.
+///
+/// Uses the classic "has zero byte" trick on the inverted word. Bytes above
+/// the first escape may be flagged spuriously (borrow propagation), but the
+/// lowest flagged byte is always the first escape, which is all the decoder
+/// uses. Returns 0 if there is no escape.
 #[inline(always)]
-fn has_escape(word: u32) -> bool {
+fn escape_mask(word: u64) -> u64 {
     let x = !word; // escape bytes become zero bytes
-    x.wrapping_sub(0x0101_0101) & !x & 0x8080_8080 != 0
+    x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080
 }
 
 #[cfg(test)]
@@ -314,11 +375,20 @@ mod tests {
 
     #[test]
     fn escape_detection() {
-        assert!(!has_escape(0x0001_02FE));
-        assert!(has_escape(0xFF00_0000));
-        assert!(has_escape(0x0000_00FF));
-        assert!(has_escape(0x01FF_0101));
-        assert!(!has_escape(0));
+        let first = |w: u64| (escape_mask(w).trailing_zeros() / 8) as usize;
+        // Exhaustive over the byte patterns that matter: 0xFF, 0xFE (borrow
+        // edge case), 0x00 and an ordinary byte, in every position.
+        let vals = [0xFFu8, 0xFE, 0x00, 0x41];
+        for pattern in 0..4u32.pow(8) {
+            let mut bytes = [0u8; 8];
+            let mut p = pattern;
+            for b in &mut bytes {
+                *b = vals[(p % 4) as usize];
+                p /= 4;
+            }
+            let expected = bytes.iter().position(|&b| b == 0xFF).unwrap_or(8);
+            assert_eq!(first(u64::from_le_bytes(bytes)), expected, "{bytes:02x?}");
+        }
     }
 
     #[test]

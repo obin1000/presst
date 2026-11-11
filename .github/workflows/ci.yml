@@ -89,4 +89,4 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
-      - run: cargo fuzz build --dev
+      - run: cargo fuzz build --dev --target x86_64-unknown-linux-gnu

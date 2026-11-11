@@ -44,7 +44,7 @@ jobs:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: fuzz-corpus-${{ matrix.target }}-
-      - run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=60
+      - run: cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -max_total_time=60
       - if: failure()
         uses: actions/upload-artifact@v4
         with:

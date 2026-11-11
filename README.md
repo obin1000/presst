@@ -3,9 +3,8 @@
 **PREtrained Static Symbol Table compression**: FSST-style string compression
 with symbol tables that are trained offline, once, instead of per block.
 
-> Status: early development. The core codec works and is heavily tested; the
-> trainer, CLI and benchmarks are in progress. The binary format is not stable
-> before 1.0.
+> Status: early development. The core codec, trainer, CLI and benchmark
+> harness work and are tested; the binary format is not stable before 1.0.
 
 ## The idea
 
@@ -34,6 +33,38 @@ presst separates the two steps:
 The goal is speed, not a better compression ratio: the biggest wins are
 expected for small inputs and per-string (columnar) compression, where FSST's
 per-block training and table overhead dominate.
+
+## Results
+
+Held-out data from the 23 datasets of the FSST paper's dbtext corpus: every
+dictionary or table is trained on the first half of each dataset and measured
+on the second half. Single thread, Intel i7-7740X. Full method and all
+scenarios in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+
+| | Individual strings | | 128 B blocks | | 1 MiB blocks | |
+|---|---:|---:|---:|---:|---:|---:|
+| **Codec** | **Ratio** | **Decompress** | **Ratio** | **Decompress** | **Ratio** | **Decompress** |
+| **presst** | **2.29** | 1.3 GB/s | **2.26** | 2.6 GB/s | 2.31 | **4.3 GB/s** |
+| FSST, table per block | – | – | 0.60 | 0.2 GB/s | 2.09 | 3.5 GB/s |
+| FSST, table trained once | 2.07 | 1.1 GB/s | 2.06 | 2.3 GB/s | 2.10 | 3.5 GB/s |
+| LZ4 | 0.95 | 1.5 GB/s | 1.07 | 3.0 GB/s | 1.61 | 2.7 GB/s |
+| zstd -3 + dictionary (≤110 KiB) | 0.90 | 0.2 GB/s | 1.81 | 0.3 GB/s | 2.72 | 0.9 GB/s |
+
+presst compresses at about 400 MB/s in all scenarios (per-block FSST: under
+1 MB/s for 128 B blocks, 180 MB/s for 1 MiB blocks, because it trains a table
+for every block). zstd reaches better ratios on large blocks, at a quarter of
+the decompression speed. Decoding one random string takes about 40 ns.
+
+What this shows so far:
+
+- **Pretraining removes FSST's small-input penalty.** A per-block table costs
+  more than a 128-byte block saves; a shared dictionary costs nothing per block.
+- **More training compute pays off.** On unseen data, the extended trainer's
+  dictionaries beat FSST's own training algorithm by about 6% in ratio (2.31 vs
+  2.17 with the same presst codec), and FSST's per-block tables by about 10%
+  (2.31 vs 2.09 on 1 MiB blocks).
+- **The decoder is faster than fsst-rs** on large blocks, mainly because a full
+  dictionary (255 symbols) can skip invalid-code checks without losing safety.
 
 ## Usage
 
@@ -75,17 +106,29 @@ decompressor.decompress_string(&batch, 1, &mut out)?;
 |---|---|
 | `presst` | Core library: dictionaries, codec, frames, string batches |
 | `presst-train` | Offline dictionary trainer |
-| `presst-cli` | `presst` command-line tool |
+| `presst-cli` | `presst` command-line tool: `train`, `compress`, `decompress`, `inspect`, `eval` |
 | `presst-bench` | Benchmarks and evaluation against FSST, LZ4 and zstd (not published) |
 
 ## Roadmap
 
 - [x] Core U8 codec, frames, string batches, golden files, fuzz targets
-- [ ] Trainer: FSST-faithful baseline, large-sample training, local search
-- [ ] CLI: `train`, `compress`, `decompress`, `inspect`, `eval`
-- [ ] Benchmarks against per-block FSST, LZ4, zstd and zstd with trained dictionaries
+- [x] Trainer: FSST-faithful baseline, large-sample training, local search
+- [x] CLI: `train`, `compress`, `decompress`, `inspect`, `eval`
+- [x] Benchmarks against per-block FSST, LZ4, zstd and zstd with trained dictionaries
+- [ ] Faster encoder (currently ~400 MB/s)
+- [ ] Built-in dictionaries for common data (URLs, logs, TPC-H text)
 - [ ] Wide code schemes (`U16`, `Hybrid8x16`) and multi-dictionary frames
 - [ ] GPU backend (CUDA)
+
+## Command line
+
+```sh
+presst train data/*.txt --lines -o urls.pdict     # train on sample data (one string per line)
+presst compress -d urls.pdict input.txt -o input.prs
+presst decompress -d urls.pdict input.prs -o input.txt
+presst inspect urls.pdict --symbols
+presst eval -d urls.pdict held-out.txt --lines   # ratio and speed on other data
+```
 
 ## License
 

@@ -181,10 +181,27 @@ pub(crate) fn compress_frame(comp: &Compressor, input: &[u8], options: FrameOpti
     };
     out.reserve(24 + input.len() + input.len() / 2 + 16);
     header.write(out);
+    let blocks = input.len().div_ceil(block_size);
     if input.is_empty() {
         write_block(comp, &[], true, out);
+    } else if cfg!(feature = "parallel") && blocks > 1 {
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            let parts: Vec<Vec<u8>> = input
+                .par_chunks(block_size)
+                .enumerate()
+                .map(|(i, chunk)| {
+                    let mut part = Vec::with_capacity(chunk.len() + BLOCK_HEADER_LEN + 16);
+                    write_block(comp, chunk, i + 1 == blocks, &mut part);
+                    part
+                })
+                .collect();
+            for part in parts {
+                out.extend_from_slice(&part);
+            }
+        }
     } else {
-        let blocks = input.len().div_ceil(block_size);
         for (i, chunk) in input.chunks(block_size).enumerate() {
             write_block(comp, chunk, i + 1 == blocks, out);
         }
@@ -247,17 +264,43 @@ pub(crate) fn decompress_frame(dec: &Decompressor, frame: &[u8], out: &mut Vec<u
         }
         out.reserve(size as usize);
     }
-    let start = out.len();
+    // Parse the block index first: it validates sizes before any decoding
+    // and lets blocks be decoded in parallel.
+    let mut blocks = Vec::new();
     loop {
         let bh = BlockHeader::parse(r.array()?, &header, dec.max_expansion())?;
-        let payload = r.bytes(bh.csize)?;
-        if bh.raw {
-            out.extend_from_slice(payload);
-        } else {
-            dec.decompress_block_into(payload, bh.dsize, out)?;
-        }
+        blocks.push((bh, r.bytes(bh.csize)?));
         if bh.last {
             break;
+        }
+    }
+    let start = out.len();
+    let decode = |(bh, payload): &(BlockHeader, &[u8]), out: &mut Vec<u8>| -> Result<()> {
+        if bh.raw {
+            out.extend_from_slice(payload);
+            Ok(())
+        } else {
+            dec.decompress_block_into(payload, bh.dsize, out)
+        }
+    };
+    if cfg!(feature = "parallel") && blocks.len() > 1 {
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            let parts: Vec<Vec<u8>> = blocks
+                .par_iter()
+                .map(|b| {
+                    let mut part = Vec::new();
+                    decode(b, &mut part).map(|()| part)
+                })
+                .collect::<Result<_>>()?;
+            for part in parts {
+                out.extend_from_slice(&part);
+            }
+        }
+    } else {
+        for b in &blocks {
+            decode(b, out)?;
         }
     }
     let produced = out.len() - start;
