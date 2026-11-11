@@ -10,9 +10,11 @@
 #![allow(
     unreachable_pub,
     clippy::case_sensitive_file_extension_comparisons,
-    clippy::doc_markdown
+    clippy::doc_markdown,
+    clippy::too_many_lines
 )]
 
+mod colreport;
 mod data;
 
 use std::collections::BTreeMap;
@@ -29,6 +31,7 @@ fn main() -> Result<()> {
         Some("report") => report(Path::new(
             args.get(1).context("usage: cargo xtask report <results.jsonl>")?,
         )),
+        Some("colreport") => colreport::run(&args[1..]),
         Some("data") => match args.get(1).map(String::as_str) {
             Some("loghub") => data::loghub::run(),
             Some("clickbench") => data::clickbench::run(),
