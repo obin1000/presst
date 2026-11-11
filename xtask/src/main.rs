@@ -30,8 +30,13 @@ fn main() -> Result<()> {
             args.get(1).context("usage: cargo xtask report <results.jsonl>")?,
         )),
         Some("data") => match args.get(1).map(String::as_str) {
-            Some("loghub" | "all") => data::loghub::run(),
-            _ => bail!("usage: cargo xtask data <loghub|all>"),
+            Some("loghub") => data::loghub::run(),
+            Some("clickbench") => data::clickbench::run(),
+            Some("publicbi") => data::publicbi::run(),
+            Some("all") => data::loghub::run()
+                .and_then(|()| data::clickbench::run())
+                .and_then(|()| data::publicbi::run()),
+            _ => bail!("usage: cargo xtask data <loghub|clickbench|publicbi|all>"),
         },
         _ => {
             eprintln!("usage: cargo xtask <corpus | report <results.jsonl> | data <dataset>>");

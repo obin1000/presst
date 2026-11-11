@@ -13,7 +13,7 @@ path = "src/bin/presst-eval.rs"
 
 [[bin]]
 name = "presst-colbench"
-path = "src/bin/presst-colbench.rs"
+path = "src/bin/presst-colbench/main.rs"
 
 [[bench]]
 name = "codec"

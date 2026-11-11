@@ -16,6 +16,9 @@ md-5 = "0.10"
 flate2 = "1"
 tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+parquet = { version = "60", default-features = false, features = ["snap", "flate2", "flate2-rust_backend", "zstd", "lz4", "brotli"] }
+bzip2 = "0.6"
+csv = "1"
 
 [lints]
 workspace = true

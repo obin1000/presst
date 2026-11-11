@@ -25,6 +25,9 @@ pub struct Encoded {
     pub offsets: Vec<u32>,
     /// Uncompressed length of every value.
     pub lens: Vec<u32>,
+    /// Parsed per-row-group FSST table, kept in memory like a database keeps
+    /// it per segment (its serialized bytes are part of `data`).
+    pub fsst_table: Option<(Vec<fsst::Symbol>, Vec<u8>)>,
 }
 
 /// A string column codec.
@@ -100,6 +103,7 @@ impl ColumnCodec for PresstColumn {
             data,
             offsets,
             lens: lens_of(values),
+            fsst_table: None,
         }
     }
     fn scan_vector(&self, enc: &Encoded, vector: usize, out: &mut Vec<u8>) {
@@ -168,24 +172,24 @@ impl ColumnCodec for FsstRowGroup {
             data.extend_from_slice(&comp.compress(v));
             offsets.push(data.len() as u32);
         }
+        let (symbols, lens, _) = fsst_symbols(&data);
         Encoded {
             data,
             offsets,
             lens: lens_of(values),
+            fsst_table: Some((symbols, lens)),
         }
     }
     fn scan_vector(&self, enc: &Encoded, vector: usize, out: &mut Vec<u8>) {
-        // The table is parsed per vector here; DuckDB keeps it per segment,
-        // so this slightly favours nothing but simplicity (parsing is cheap).
-        let (symbols, lens, _) = fsst_symbols(&enc.data);
-        let dec = fsst::Decompressor::new(&symbols, &lens);
+        let (symbols, lens) = enc.fsst_table.as_ref().expect("fsst table");
+        let dec = fsst::Decompressor::new(symbols, lens);
         let r = vector_range(enc.lens.len(), vector);
         let codes = &enc.data[enc.offsets[r.start] as usize..enc.offsets[r.end] as usize];
         fsst_decode(&dec, codes, decoded_len(&enc.lens, r), out);
     }
     fn get(&self, enc: &Encoded, row: usize, out: &mut Vec<u8>) {
-        let (symbols, lens, _) = fsst_symbols(&enc.data);
-        let dec = fsst::Decompressor::new(&symbols, &lens);
+        let (symbols, lens) = enc.fsst_table.as_ref().expect("fsst table");
+        let dec = fsst::Decompressor::new(symbols, lens);
         let codes = &enc.data[enc.offsets[row] as usize..enc.offsets[row + 1] as usize];
         fsst_decode(&dec, codes, enc.lens[row] as usize, out);
     }
@@ -225,6 +229,7 @@ impl ColumnCodec for FsstShared {
             data,
             offsets,
             lens: lens_of(values),
+            fsst_table: None,
         }
     }
     fn scan_vector(&self, enc: &Encoded, vector: usize, out: &mut Vec<u8>) {
@@ -276,6 +281,7 @@ impl<C: crate::BlockCodec + SharedBytes> ColumnCodec for PerVector<C> {
             data,
             offsets,
             lens: lens_of(values),
+            fsst_table: None,
         }
     }
     fn scan_vector(&self, enc: &Encoded, vector: usize, out: &mut Vec<u8>) {
@@ -314,61 +320,155 @@ impl SharedBytes for crate::Zstd {
 
 // ---------------------------------------------------------------- measurement
 
+/// A row group after the dictionary layer that column stores apply before
+/// string compression (DuckDB's dictionary/FSST, Parquet's dictionary pages):
+/// the distinct values in first-occurrence order, plus one index per row.
+/// Every codec gets the same layer, so only the distinct values are compared.
+pub struct DictGroup<'a> {
+    /// Distinct values.
+    pub distinct: Vec<&'a [u8]>,
+    /// Index into `distinct` for every row.
+    pub index: Vec<u32>,
+}
+
+/// Applies the dictionary layer to one row group.
+#[must_use]
+pub fn dict_layer<'a>(rows: &[&'a [u8]]) -> DictGroup<'a> {
+    let mut map: std::collections::HashMap<&'a [u8], u32> = std::collections::HashMap::with_capacity(rows.len());
+    let mut distinct = Vec::new();
+    let index = rows
+        .iter()
+        .map(|&v| {
+            *map.entry(v).or_insert_with(|| {
+                distinct.push(v);
+                (distinct.len() - 1) as u32
+            })
+        })
+        .collect();
+    DictGroup { distinct, index }
+}
+
+/// Size of a bit-packed index: `rows * ceil(log2(distinct))` bits.
+#[must_use]
+pub fn index_bytes(rows: usize, distinct: usize) -> u64 {
+    let bits = if distinct <= 1 {
+        0
+    } else {
+        usize::BITS - (distinct - 1).leading_zeros()
+    };
+    (rows as u64 * u64::from(bits)).div_ceil(8)
+}
+
 /// Results for one codec on one column.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ColumnResult {
     /// Codec name.
     pub codec: String,
-    /// Number of values.
+    /// Number of values (rows).
     pub values: usize,
-    /// Uncompressed value bytes.
+    /// Uncompressed value bytes of all rows.
     pub input_bytes: u64,
-    /// Compressed bytes (excluding value lengths, which every codec stores).
+    /// Distinct values summed over row groups.
+    pub distinct_values: usize,
+    /// Uncompressed bytes of the distinct values.
+    pub distinct_bytes: u64,
+    /// Bit-packed row indices (the same for every codec).
+    pub index_bytes: u64,
+    /// Compressed distinct values (excluding value lengths, which every codec stores).
     pub compressed_bytes: u64,
-    /// `input_bytes / compressed_bytes`.
+    /// Whole column: `input_bytes / (compressed_bytes + index_bytes)`.
     pub ratio: f64,
+    /// String compression alone: `distinct_bytes / compressed_bytes`.
+    pub ratio_distinct: f64,
     /// Shared dictionary/table bytes, stored once per column.
     pub shared_bytes: usize,
-    /// Compression throughput, MB/s of input.
+    /// Compression throughput, MB/s of distinct values.
     pub compress_mbps: f64,
-    /// Full scan (all vectors), MB/s of output.
+    /// Full scan (all vectors of distinct values), MB/s of output.
     pub scan_mbps: f64,
-    /// Mean point-lookup latency in nanoseconds.
+    /// Mean point-lookup latency (index + value) in nanoseconds.
     pub lookup_ns: f64,
     /// Lookups in the timed run (fewer than requested if the time budget ran out).
     pub lookups: usize,
 }
 
-/// Compresses `values` in row groups, verifies scans and lookups, and times
-/// compression, full scans and `lookups` random point lookups. Each timing is
-/// the median of `runs` runs.
+struct Prepared<'a> {
+    groups: Vec<DictGroup<'a>>,
+    input: u64,
+    distinct_values: usize,
+    distinct_bytes: u64,
+    index_bytes: u64,
+}
+
+fn prepare<'a>(values: &[&'a [u8]]) -> Prepared<'a> {
+    let groups: Vec<DictGroup<'a>> = values.chunks(ROW_GROUP).map(dict_layer).collect();
+    Prepared {
+        input: values.iter().map(|v| v.len() as u64).sum(),
+        distinct_values: groups.iter().map(|g| g.distinct.len()).sum(),
+        distinct_bytes: groups.iter().flat_map(|g| &g.distinct).map(|v| v.len() as u64).sum(),
+        index_bytes: groups
+            .iter()
+            .map(|g| index_bytes(g.index.len(), g.distinct.len()))
+            .sum(),
+        groups,
+    }
+}
+
+/// Decodes every vector of every group and checks it against the distinct values.
+fn verify_scan(codec: &dyn ColumnCodec, p: &Prepared<'_>, encoded: &[Encoded]) {
+    let mut out = Vec::new();
+    for (g, enc) in p.groups.iter().zip(encoded) {
+        for v in 0..g.distinct.len().div_ceil(VECTOR) {
+            out.clear();
+            codec.scan_vector(enc, v, &mut out);
+            assert!(
+                out == g.distinct[vector_range(g.distinct.len(), v)].concat(),
+                "{}: scan mismatch",
+                codec.name()
+            );
+        }
+    }
+}
+
+fn result(codec: &dyn ColumnCodec, p: &Prepared<'_>, encoded: &[Encoded], values: usize) -> ColumnResult {
+    let compressed: u64 = encoded.iter().map(|e| e.data.len() as u64).sum();
+    ColumnResult {
+        codec: codec.name(),
+        values,
+        input_bytes: p.input,
+        distinct_values: p.distinct_values,
+        distinct_bytes: p.distinct_bytes,
+        index_bytes: p.index_bytes,
+        compressed_bytes: compressed,
+        ratio: p.input as f64 / (compressed + p.index_bytes).max(1) as f64,
+        ratio_distinct: p.distinct_bytes as f64 / compressed.max(1) as f64,
+        shared_bytes: codec.shared_bytes(),
+        compress_mbps: 0.0,
+        scan_mbps: 0.0,
+        lookup_ns: 0.0,
+        lookups: 0,
+    }
+}
+
+/// Applies the dictionary layer per row group, compresses the distinct values,
+/// verifies scans and lookups, and times compression, full scans and random
+/// point lookups (row -> index -> value). Each timing is the median of `runs`.
 ///
 /// # Panics
 /// Panics if a value does not round-trip.
 pub fn measure_column(codec: &dyn ColumnCodec, values: &[&[u8]], runs: usize, lookups: usize) -> ColumnResult {
-    let input: u64 = values.iter().map(|v| v.len() as u64).sum();
-    let groups: Vec<&[&[u8]]> = values.chunks(ROW_GROUP).collect();
+    let p = prepare(values);
     let runs = runs.max(1);
 
     let mut encoded = Vec::new();
     let compress = median(runs, || {
         let t = Instant::now();
-        encoded = groups.iter().map(|g| codec.encode(g)).collect::<Vec<_>>();
+        encoded = p.groups.iter().map(|g| codec.encode(&g.distinct)).collect::<Vec<_>>();
         t.elapsed().as_secs_f64()
     });
+    verify_scan(codec, &p, &encoded);
 
-    // Verify the scan once, outside the timing.
-    let mut out = Vec::with_capacity(input as usize + 64);
-    let mut row = 0;
-    for (g, enc) in groups.iter().zip(&encoded) {
-        for v in 0..g.len().div_ceil(VECTOR) {
-            out.clear();
-            codec.scan_vector(enc, v, &mut out);
-            let expected: Vec<u8> = g[vector_range(g.len(), v)].concat();
-            assert!(out == expected, "{}: scan mismatch at row {row}", codec.name());
-            row += VECTOR;
-        }
-    }
+    let mut out = Vec::with_capacity(p.distinct_bytes as usize + 64);
     let scan = median(runs, || {
         let t = Instant::now();
         for enc in &encoded {
@@ -385,9 +485,13 @@ pub fn measure_column(codec: &dyn ColumnCodec, values: &[&[u8]], runs: usize, lo
     let rows: Vec<usize> = (0..lookups)
         .map(|i| ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 11) as usize % n.max(1))
         .collect();
+    let get = |r: usize, out: &mut Vec<u8>| {
+        let g = &p.groups[r / ROW_GROUP];
+        codec.get(&encoded[r / ROW_GROUP], g.index[r % ROW_GROUP] as usize, out);
+    };
     for &r in rows.iter().take(1000) {
         out.clear();
-        codec.get(&encoded[r / ROW_GROUP], r % ROW_GROUP, &mut out);
+        get(r, &mut out);
         assert!(out == values[r], "{}: lookup mismatch at row {r}", codec.name());
     }
     // Lookups run until all rows are done or a time budget is used up, so
@@ -397,9 +501,8 @@ pub fn measure_column(codec: &dyn ColumnCodec, values: &[&[u8]], runs: usize, lo
         let t = Instant::now();
         let mut i = 0;
         while i < rows.len() {
-            let r = rows[i];
             out.clear();
-            codec.get(&encoded[r / ROW_GROUP], r % ROW_GROUP, &mut out);
+            get(rows[i], &mut out);
             i += 1;
             if i % 256 == 0 && t.elapsed().as_secs_f64() > LOOKUP_BUDGET_SECS {
                 break;
@@ -409,19 +512,24 @@ pub fn measure_column(codec: &dyn ColumnCodec, values: &[&[u8]], runs: usize, lo
         t.elapsed().as_secs_f64() / i.max(1) as f64
     });
 
-    let compressed: u64 = encoded.iter().map(|e| e.data.len() as u64).sum();
-    ColumnResult {
-        codec: codec.name(),
-        values: n,
-        input_bytes: input,
-        compressed_bytes: compressed,
-        ratio: input as f64 / compressed.max(1) as f64,
-        shared_bytes: codec.shared_bytes(),
-        compress_mbps: input as f64 / 1e6 / compress,
-        scan_mbps: input as f64 / 1e6 / scan,
-        lookup_ns: lookup * 1e9,
-        lookups: done,
-    }
+    let mut r = result(codec, &p, &encoded, n);
+    r.compress_mbps = p.distinct_bytes as f64 / 1e6 / compress;
+    r.scan_mbps = p.distinct_bytes as f64 / 1e6 / scan;
+    r.lookup_ns = lookup * 1e9;
+    r.lookups = done;
+    r
+}
+
+/// Compression ratio only (no timing), for the extra training levels where
+/// speed is not the question. Same dictionary layer; still verifies every vector.
+///
+/// # Panics
+/// Panics if a value does not round-trip.
+pub fn measure_ratio(codec: &dyn ColumnCodec, values: &[&[u8]]) -> ColumnResult {
+    let p = prepare(values);
+    let encoded: Vec<Encoded> = p.groups.iter().map(|g| codec.encode(&g.distinct)).collect();
+    verify_scan(codec, &p, &encoded);
+    result(codec, &p, &encoded, values.len())
 }
 
 fn median(runs: usize, mut f: impl FnMut() -> f64) -> f64 {

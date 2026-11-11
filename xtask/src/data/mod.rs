@@ -6,7 +6,9 @@
 //! `<column>.test.time` with the seconds elapsed since the end of the
 //! training period for every test value (for the aging test).
 
+pub mod clickbench;
 pub mod loghub;
+pub mod publicbi;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -66,7 +68,13 @@ pub fn fetch(dataset: &str) -> Result<Vec<PathBuf>> {
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
     {
-        let (sum, url) = line.split_once(' ').context("bad sources line")?;
+        let mut parts = line.split_whitespace();
+        let (sum, url) = (
+            parts.next().context("bad sources line")?,
+            parts.next().context("bad sources line")?,
+        );
+        // Optional `bytes=<from>-<to>`: only that prefix is downloaded.
+        let range = parts.next().and_then(|r| r.strip_prefix("bytes="));
         let name = url
             .rsplit('/')
             .next()
@@ -81,11 +89,12 @@ pub fn fetch(dataset: &str) -> Result<Vec<PathBuf>> {
         };
         if !ok {
             eprintln!("downloading {url}");
-            let status = Command::new("curl")
-                .args(["-sSfL", "--retry", "3", "-o"])
-                .arg(&path)
-                .arg(url)
-                .status()?;
+            let mut cmd = Command::new("curl");
+            cmd.args(["-sSfL", "--retry", "3"]);
+            if let Some(r) = range {
+                cmd.args(["-r", r]);
+            }
+            let status = cmd.arg("-o").arg(&path).arg(url).status()?;
             if !status.success() {
                 bail!("download failed: {url}");
             }
