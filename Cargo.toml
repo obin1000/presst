@@ -57,6 +57,8 @@ cast_possible_wrap = "allow"
 module_name_repetitions = "allow"
 # Every fallible API returns `presst::Error`, whose variants are documented there.
 missing_errors_doc = "allow"
+# Ratios and throughput are reported as floats.
+cast_precision_loss = "allow"
 similar_names = "allow"
 many_single_char_names = "allow"
 inline_always = "allow"

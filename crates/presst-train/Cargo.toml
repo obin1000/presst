@@ -12,6 +12,10 @@ categories = ["compression"]
 
 [dependencies]
 presst = { workspace = true, features = ["std"] }
+rayon = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+xxhash-rust = { workspace = true }
 
 [lints]
 workspace = true
