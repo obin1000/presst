@@ -1,0 +1,16 @@
+# Loghub full logs (https://github.com/logpai/loghub), Zenodo record 8196385.
+# "The datasets are freely available for research or academic work."
+# Format: <checksum> <url>. Fetched by `cargo xtask data loghub` into corpora/download/loghub/.
+md5:de9a42d12f9b60612631c67a5a9f8628 https://zenodo.org/records/8196385/files/Apache.tar.gz
+md5:6d1802d7778126f21c001c6aa7b6b106 https://zenodo.org/records/8196385/files/Linux.tar.gz
+md5:11458b4f9fa0911c238f5c1189d4f2d4 https://zenodo.org/records/8196385/files/Zookeeper.tar.gz
+md5:2612fce12cc3d16599ddb3db8e9c477a https://zenodo.org/records/8196385/files/Proxifier.tar.gz
+md5:e5d0558b6ec661c739e77c7ff1b71498 https://zenodo.org/records/8196385/files/Mac.tar.gz
+md5:cec2cca71da9c4f8e33eaa9b215f1b90 https://zenodo.org/records/8196385/files/HealthApp.tar.gz
+md5:66bd42c07837a094d9b0ea2d036b5713 https://zenodo.org/records/8196385/files/OpenStack.tar.gz
+md5:a44e40b4348697dabf2bba56885e0a38 https://zenodo.org/records/8196385/files/SSH.tar.gz
+md5:15b3bcf44cf5c98e35451efa22a0de77 https://zenodo.org/records/8196385/files/HPC.zip
+md5:34e28a9943704fd54933e2b455829fcc https://zenodo.org/records/8196385/files/Hadoop.zip
+md5:4452953c470f2d95fcb32d5f6e733f7a https://zenodo.org/records/8196385/files/BGL.zip
+md5:76a24b4d9a6164d543fb275f89773260 https://zenodo.org/records/8196385/files/HDFS_v1.zip
+md5:31ddaff179f6c1ae5203770138156b17 https://zenodo.org/records/8196385/files/Spark.tar.gz

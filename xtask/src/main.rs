@@ -3,6 +3,17 @@
 //! * `corpus`: download the benchmark corpus listed in `corpora/*.sha256`
 //!   into `corpora/data/` and verify every file.
 //! * `report <results.jsonl>`: summarize `presst-eval` results as Markdown.
+//! * `data <loghub|all>`: download real datasets and extract string columns
+//!   for `presst-colbench` (see `data/mod.rs`).
+
+// Internal tool: module items are `pub` for readability, file names are ours.
+#![allow(
+    unreachable_pub,
+    clippy::case_sensitive_file_extension_comparisons,
+    clippy::doc_markdown
+)]
+
+mod data;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -18,8 +29,12 @@ fn main() -> Result<()> {
         Some("report") => report(Path::new(
             args.get(1).context("usage: cargo xtask report <results.jsonl>")?,
         )),
+        Some("data") => match args.get(1).map(String::as_str) {
+            Some("loghub" | "all") => data::loghub::run(),
+            _ => bail!("usage: cargo xtask data <loghub|all>"),
+        },
         _ => {
-            eprintln!("usage: cargo xtask <corpus | report <results.jsonl>>");
+            eprintln!("usage: cargo xtask <corpus | report <results.jsonl> | data <dataset>>");
             std::process::exit(2);
         }
     }
@@ -151,7 +166,7 @@ fn normalize(codec: &str) -> String {
     if let Some(rest) = codec.strip_prefix("zstd -3 + ") {
         if let Some(kib) = rest.strip_suffix(" KiB dict") {
             let max = if kib == "2" { 2 } else { 110 };
-            return format!("zstd -3 + dict (max {max} KiB)");
+            return format!("zstd -3 +dict{max}K");
         }
     }
     codec.to_owned()

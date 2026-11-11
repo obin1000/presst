@@ -11,6 +11,10 @@ publish = false
 name = "presst-eval"
 path = "src/bin/presst-eval.rs"
 
+[[bin]]
+name = "presst-colbench"
+path = "src/bin/presst-colbench.rs"
+
 [[bench]]
 name = "codec"
 harness = false
