@@ -106,8 +106,30 @@ presst_decode_splits_global(const uint8_t* __restrict__ in,
 // Encoding.
 #include "presst_encode.cuh"
 
-// One thread per range, encode tables in shared memory. Writes the code length
-// of every range to out_lens.
+// Encode tables copied into shared memory by every thread block.
+struct SharedEncodeTables {
+    uint64_t long_sym[kLongSlots];
+    uint8_t long_len[kLongSlots];
+    uint8_t long_code[kLongSlots];
+    uint32_t two[kTwoSlots];
+    uint8_t byte_code[256];
+
+    __device__ void load(const EncodeTable* __restrict__ table) {
+        for (uint32_t i = threadIdx.x; i < kLongSlots; i += blockDim.x) {
+            long_sym[i] = table->long_sym[i];
+            long_len[i] = table->long_len[i];
+            long_code[i] = table->long_code[i];
+        }
+        for (uint32_t i = threadIdx.x; i < kTwoSlots; i += blockDim.x) two[i] = table->two[i];
+        for (uint32_t i = threadIdx.x; i < 256; i += blockDim.x) byte_code[i] = table->byte_code[i];
+        __syncthreads();
+    }
+
+    __device__ EncodeTables view() const { return EncodeTables{long_sym, long_len, long_code, two, byte_code}; }
+};
+
+// One thread per range, input read from global memory (string batches). Writes
+// the code length of every range to out_lens.
 extern "C" __global__ void __launch_bounds__(256)
 presst_encode_ranges(const uint8_t* __restrict__ in,
                      const Range* __restrict__ ranges,
@@ -115,34 +137,51 @@ presst_encode_ranges(const uint8_t* __restrict__ in,
                      const EncodeTable* __restrict__ table,
                      uint8_t* __restrict__ out,
                      uint32_t* __restrict__ out_lens) {
-    __shared__ uint64_t long_sym[kLongSlots];
-    __shared__ uint8_t long_len[kLongSlots];
-    __shared__ uint8_t long_code[kLongSlots];
-    __shared__ uint32_t two[kTwoSlots];
-    __shared__ uint8_t byte_code[256];
-    for (uint32_t i = threadIdx.x; i < kLongSlots; i += blockDim.x) {
-        long_sym[i] = table->long_sym[i];
-        long_len[i] = table->long_len[i];
-        long_code[i] = table->long_code[i];
-    }
-    for (uint32_t i = threadIdx.x; i < kTwoSlots; i += blockDim.x) two[i] = table->two[i];
-    for (uint32_t i = threadIdx.x; i < 256; i += blockDim.x) byte_code[i] = table->byte_code[i];
-    __syncthreads();
+    __shared__ SharedEncodeTables t;
+    t.load(table);
+    const EncodeTables view = t.view();
     for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_ranges; i += gridDim.x * blockDim.x) {
         Range r = ranges[i];
-        out_lens[i] = encode_range(in, r, long_sym, long_len, long_code, two, byte_code, out);
+        out_lens[i] = encode_range(in, r, view, out);
+    }
+}
+
+// Tiled: one warp per 32 consecutive ranges, input staged through shared
+// memory (frames: range starts are multiples of the split size).
+extern "C" __global__ void __launch_bounds__(256)
+presst_encode_ranges_tiled(const uint8_t* __restrict__ in,
+                           const Range* __restrict__ ranges,
+                           uint32_t n_ranges,
+                           const EncodeTable* __restrict__ table,
+                           uint8_t* __restrict__ out,
+                           uint32_t* __restrict__ out_lens) {
+    __shared__ SharedEncodeTables t;
+    __shared__ __align__(16) uint8_t rows[8][32 * kRowBytes];
+    t.load(table);
+    const EncodeTables view = t.view();
+    const uint32_t warp = threadIdx.x / 32;
+    const uint32_t lane = threadIdx.x % 32;
+    const uint32_t warps = gridDim.x * 8;
+    for (uint32_t first = (blockIdx.x * 8 + warp) * 32; first < n_ranges; first += warps * 32) {
+        const uint32_t i = first + lane;
+        Range r = i < n_ranges ? ranges[i] : Range{0, 0, 0, 0};
+        if (i >= n_ranges) r.in_start = ranges[first].in_start;  // a valid address to load from
+        const uint32_t n = encode_range_tiled(in, r, view, out, rows[warp]);
+        if (i < n_ranges) out_lens[i] = n;
     }
 }
 
 // Compaction: one warp per range copies its codes from the scratch area to
-// dst[dst_offsets[i] ..].
+// dst[dst_offsets[i] ..]. Word j of a range's codes is at out_start + j * word_stride
+// (8: contiguous, 256: interleaved by the tiled encoder).
 extern "C" __global__ void __launch_bounds__(256)
 presst_gather(const uint8_t* __restrict__ scratch,
               const Range* __restrict__ ranges,
               const uint32_t* __restrict__ lens,
               const uint64_t* __restrict__ dst_offsets,
               uint32_t n_ranges,
-              uint8_t* __restrict__ dst) {
+              uint8_t* __restrict__ dst,
+              uint32_t word_stride) {
     const uint32_t warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     const uint32_t lane = threadIdx.x % 32;
     const uint32_t warps = gridDim.x * blockDim.x / 32;
@@ -150,6 +189,6 @@ presst_gather(const uint8_t* __restrict__ scratch,
         const uint8_t* src = scratch + ranges[i].out_start;
         uint8_t* d = dst + dst_offsets[i];
         const uint32_t n = lens[i];
-        for (uint32_t j = lane; j < n; j += 32) d[j] = src[j];
+        for (uint32_t j = lane; j < n; j += 32) d[j] = src[(j >> 3) * word_stride + (j & 7)];
     }
 }

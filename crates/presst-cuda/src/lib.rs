@@ -166,6 +166,7 @@ pub struct GpuContext {
     strings_shared: CudaFunction,
     strings_global: CudaFunction,
     encode: CudaFunction,
+    encode_tiled: CudaFunction,
     gather: CudaFunction,
 }
 
@@ -242,6 +243,7 @@ impl GpuContext {
                 .map(|k| module.load_function(k.symbol()))
                 .collect::<std::result::Result<_, _>>()?,
             encode: module.load_function("presst_encode_ranges")?,
+            encode_tiled: module.load_function("presst_encode_ranges_tiled")?,
             gather: module.load_function("presst_gather")?,
             strings_shared: module.load_function("presst_decode_strings_shared")?,
             strings_global: module.load_function("presst_decode_strings_global")?,
@@ -473,7 +475,9 @@ impl GpuContext {
         options: FrameOptions,
     ) -> Result<(Vec<u8>, GpuTiming)> {
         let plan = encode::plan_frame(input.len(), options);
-        let (codes, lens, timing) = self.encode_pieces(dict, input, &plan.pieces)?;
+        // Frame pieces start at multiples of the split (or block) size, as the
+        // tiled kernel needs.
+        let (codes, lens, timing) = self.encode_pieces(dict, input, &plan.pieces, true)?;
         Ok((encode::assemble_frame(&plan, &dict.dict, input, &codes, &lens), timing))
     }
 
@@ -505,7 +509,7 @@ impl GpuContext {
             pieces.push((input.len() as u64, len));
             input.extend_from_slice(s);
         }
-        let (codes, lens, timing) = self.encode_pieces(dict, &input, &pieces)?;
+        let (codes, lens, timing) = self.encode_pieces(dict, &input, &pieces, false)?;
         let mut offsets = Vec::with_capacity(strings.len() + 1);
         let mut end = 0u32;
         offsets.push(0);
@@ -533,27 +537,46 @@ impl GpuContext {
     }
 
     /// Encodes consecutive pieces of `input` on the GPU. Returns the codes of
-    /// all pieces back to back and the code length of each.
+    /// all pieces back to back and the code length of each. `tiled` selects the
+    /// kernel that stages input through shared memory; it needs piece starts
+    /// that are multiples of 4.
     fn encode_pieces(
         &self,
         dict: &GpuDictionary,
         input: &[u8],
         pieces: &[(u64, u32)],
+        tiled: bool,
     ) -> Result<(Vec<u8>, Vec<u32>, GpuTiming)> {
         if pieces.is_empty() {
             return Ok((Vec::new(), Vec::new(), GpuTiming::default()));
         }
         let n = u32::try_from(pieces.len()).map_err(|_| GpuError::Unavailable("too many pieces for one launch"))?;
-        let (ranges, scratch_len) = encode::ranges(pieces.iter().copied());
-        // 16 bytes of slack: the kernel reads 8-byte windows past the end.
-        let mut padded = Vec::with_capacity(input.len() + 16);
+        let (ranges, scratch_len) = if tiled {
+            encode::ranges_interleaved(pieces)
+        } else {
+            encode::ranges(pieces.iter().copied())
+        };
+        let word_stride: u32 = if tiled { 256 } else { 8 };
+        // Slack after the input: the plain kernel reads 8-byte windows past the
+        // end (16 bytes). The tiled kernel loads 80 bytes per step for every lane
+        // of a warp until its longest piece is done, so a short last piece can
+        // read up to the longest piece length plus 80 bytes past its start.
+        let slack = if tiled {
+            debug_assert!(pieces.iter().all(|&(start, _)| start % 4 == 0));
+            pieces.iter().map(|&(_, len)| len as usize).max().unwrap_or(0) + 128
+        } else {
+            16
+        };
+        let mut padded = Vec::with_capacity(input.len() + slack);
         padded.extend_from_slice(input);
-        padded.resize(input.len() + 16, 0);
+        padded.resize(input.len() + slack, 0);
         let input_dev = self.stream.clone_htod(&padded)?;
         let ranges_dev = self.stream.clone_htod(&encode::ranges_to_bytes(&ranges))?;
         let mut scratch = self.stream.alloc_zeros::<u8>(scratch_len as usize + 8)?;
         let mut lens_dev = self.stream.alloc_zeros::<u32>(pieces.len())?;
-        let mut launch = self.stream.launch_builder(&self.encode);
+        let mut launch = self
+            .stream
+            .launch_builder(if tiled { &self.encode_tiled } else { &self.encode });
         launch
             .arg(&input_dev)
             .arg(&ranges_dev)
@@ -567,9 +590,10 @@ impl GpuContext {
             block_dim: (DECODE_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
-        // SAFETY: the arguments match `presst_encode_ranges`. Every range reads
-        // inside `input_dev` (the input plus 16 bytes of slack for 8-byte
-        // windows) and writes at most 2 * in_len code bytes, rounded up to 8,
+        // SAFETY: the arguments match `presst_encode_ranges` and
+        // `presst_encode_ranges_tiled` (one thread per range either way, so the
+        // same grid). Every range reads inside `input_dev` (the input plus the
+        // slack computed above) and writes at most 2 * in_len code bytes, rounded up to 8,
         // inside its own scratch slot (`encode::ranges` reserves that much, plus 8
         // bytes of slack at the end).
         let encode_events = unsafe { launch.launch(cfg) }?;
@@ -590,6 +614,7 @@ impl GpuContext {
             .arg(&dst_offsets_dev)
             .arg(&n)
             .arg(&mut dst)
+            .arg(&word_stride)
             .record_kernel_launch(CUevent_flags::CU_EVENT_DEFAULT);
         let cfg = LaunchConfig {
             grid_dim: (n.div_ceil(DECODE_THREADS / 32), 1, 1),
@@ -597,8 +622,9 @@ impl GpuContext {
             shared_mem_bytes: 0,
         };
         // SAFETY: the arguments match `presst_gather`. Range i copies lens[i]
-        // bytes from its scratch slot to dst_offsets[i]; the offsets are the
-        // prefix sums of the lengths, so every copy lies inside `dst` (total + 1).
+        // bytes from its scratch slot (words `word_stride` apart, the layout the
+        // encode kernel wrote) to dst_offsets[i]; the offsets are the prefix sums
+        // of the lengths, so every copy lies inside `dst` (total + 1).
         let gather_events = unsafe { gather.launch(cfg) }?;
         let mut codes = self.stream.clone_dtoh(&dst)?;
         codes.truncate(total as usize);

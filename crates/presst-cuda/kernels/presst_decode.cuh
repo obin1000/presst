@@ -40,8 +40,10 @@ enum : uint32_t {
     ERR_UNDERFLOW = 1u << 3,     // a split decodes to fewer than out_len bytes
 };
 
-// Accumulates output bytes into aligned 8-byte stores.
-struct AlignedWriter {
+// Accumulates output bytes into aligned 8-byte stores, `Stride` words apart
+// (1: contiguous; 32: interleaved with the other lanes of a warp).
+template <uint32_t Stride>
+struct StridedWriter {
     uint64_t* dst;   // next aligned word to store
     uint64_t acc;    // pending bytes (low `fill` bytes valid)
     uint32_t fill;   // 0..7
@@ -51,7 +53,8 @@ struct AlignedWriter {
         acc |= bytes << (fill * 8);
         uint32_t total = fill + n;
         if (total >= 8) {
-            *dst++ = acc;
+            *dst = acc;
+            dst += Stride;
             // fill > 0 here unless n == 8 and fill == 0 (then nothing carries over).
             acc = fill ? bytes >> ((8 - fill) * 8) : 0;
             total -= 8;
@@ -66,6 +69,8 @@ struct AlignedWriter {
         }
     }
 };
+
+using AlignedWriter = StridedWriter<1>;
 
 // Decodes one split. Returns error bits (0 on success). Never writes outside
 // [out_start, out_start + round_up(out_len, 8)).

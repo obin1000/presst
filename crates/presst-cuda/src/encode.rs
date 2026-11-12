@@ -100,6 +100,28 @@ pub(crate) fn ranges(pieces: impl IntoIterator<Item = (u64, u32)>) -> (Vec<Range
     (ranges, scratch)
 }
 
+/// Ranges for the tiled encoder, whose output is interleaved per group of 32
+/// consecutive ranges (one warp): word j of lane L goes to
+/// `group_base + (j * 32 + L) * 8`. Every group gets room for the worst case
+/// of its longest range (2 code bytes per input byte, plus one word).
+pub(crate) fn ranges_interleaved(pieces: &[(u64, u32)]) -> (Vec<Range>, u64) {
+    let mut scratch = 0u64;
+    let mut ranges = Vec::with_capacity(pieces.len());
+    for group in pieces.chunks(32) {
+        let max_len = group.iter().map(|&(_, l)| u64::from(l)).max().unwrap_or(0);
+        let words = (2 * max_len).div_ceil(8) + 1;
+        for (lane, &(in_start, in_len)) in group.iter().enumerate() {
+            ranges.push(Range {
+                in_start,
+                out_start: scratch + 8 * lane as u64,
+                in_len,
+            });
+        }
+        scratch += words * 32 * 8;
+    }
+    (ranges, scratch)
+}
+
 pub(crate) fn ranges_to_bytes(ranges: &[Range]) -> Vec<u8> {
     let mut out = Vec::with_capacity(ranges.len() * RANGE_BYTES);
     for r in ranges {

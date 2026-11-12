@@ -49,69 +49,128 @@ struct Range {
     uint32_t _pad;
 };
 
-// Encodes one range; returns the number of code bytes written.
-__device__ __forceinline__ uint32_t encode_range(const uint8_t* __restrict__ in,
-                                                 const Range& r,
-                                                 const uint64_t* __restrict__ long_sym,
-                                                 const uint8_t* __restrict__ long_len,
-                                                 const uint8_t* __restrict__ long_code,
-                                                 const uint32_t* __restrict__ two,
-                                                 const uint8_t* __restrict__ byte_code,
-                                                 uint8_t* __restrict__ out) {
+// Encode tables as seen by a kernel (shared memory).
+struct EncodeTables {
+    const uint64_t* long_sym;
+    const uint8_t* long_len;
+    const uint8_t* long_code;
+    const uint32_t* two;
+    const uint8_t* byte_code;
+};
+
+// The greedy longest match at a position: `win` holds the next 8 input bytes
+// (bytes past the end are ignored), `remaining` how many are left (> 0).
+// Sets `out`/`nout` to the code bytes to emit (1, or 2 for escape + literal)
+// and returns how many input bytes they cover.
+//
+// All three lookups always run and the result is selected without branches, so
+// the lanes of a warp stay on one path (they would otherwise take different
+// branches at almost every code). Only hash collisions loop, which is rare: the
+// tables are at most a quarter full.
+__device__ __forceinline__ uint32_t match_at(uint64_t win, uint64_t remaining, const EncodeTables& t,
+                                             uint64_t& out, uint32_t& nout) {
+    // Long symbol (3..8 bytes) with these 3 bytes as prefix, if any.
+    const uint32_t key3 = static_cast<uint32_t>(win & 0xFFFFFFu);
+    uint32_t slot3 = hash_slot(key3);
+    uint32_t l3 = t.long_len[slot3];
+    uint64_t sym3 = t.long_sym[slot3];
+    while (l3 != 0 && static_cast<uint32_t>(sym3 & 0xFFFFFFu) != key3) {
+        slot3 = (slot3 + 1) & (kLongSlots - 1);
+        l3 = t.long_len[slot3];
+        sym3 = t.long_sym[slot3];
+    }
+    const uint64_t mask3 = l3 >= 8 ? ~uint64_t{0} : ((uint64_t{1} << (8 * l3)) - 1);
+    const bool long_hit = l3 != 0 && l3 <= remaining && (win & mask3) == sym3;
+    // 2-byte symbol of the next two bytes, if any.
+    const uint32_t key2 = static_cast<uint32_t>(win & 0xFFFFu);
+    uint32_t slot2 = hash_slot(key2);
+    uint32_t e2 = t.two[slot2];
+    while (e2 != 0 && (e2 & 0xFFFFu) != key2) {
+        slot2 = (slot2 + 1) & (kTwoSlots - 1);
+        e2 = t.two[slot2];
+    }
+    const bool two_hit = e2 != 0 && remaining >= 2;
+    // 1-byte symbol, else escape.
+    const uint32_t b = static_cast<uint32_t>(win & 0xFFu);
+    const uint32_t c1 = t.byte_code[b];
+    const bool one_hit = c1 != 255u;
+
+    const uint32_t code = long_hit ? t.long_code[slot3] : two_hit ? ((e2 >> 16) & 0xFFu) : c1;
+    const bool escape = !long_hit && !two_hit && !one_hit;
+    out = escape ? (0xFFu | (static_cast<uint64_t>(b) << 8)) : code;
+    nout = escape ? 2u : 1u;
+    return long_hit ? l3 : two_hit ? 2u : 1u;
+}
+
+// Encodes one range, reading the input from global memory; returns the number
+// of code bytes written.
+__device__ __forceinline__ uint32_t encode_range(const uint8_t* __restrict__ in, const Range& r,
+                                                 const EncodeTables& t, uint8_t* __restrict__ out) {
     AlignedWriter w{reinterpret_cast<uint64_t*>(out + r.out_start), 0, 0};
     uint32_t written = 0;
     uint64_t pos = r.in_start;
     const uint64_t end = r.in_start + r.in_len;
     while (pos < end) {
-        const uint64_t win = load_window(in, pos);
-        const uint64_t remaining = end - pos;
-        uint32_t code = 0;
-        uint32_t mlen = 0;
-        if (remaining >= 3) {
-            const uint32_t key = static_cast<uint32_t>(win & 0xFFFFFFu);
-            for (uint32_t slot = hash_slot(key);; slot = (slot + 1) & (kLongSlots - 1)) {
-                const uint32_t l = long_len[slot];
-                if (l == 0) break;
-                const uint64_t sym = long_sym[slot];
-                if (static_cast<uint32_t>(sym & 0xFFFFFFu) == key) {
-                    const uint64_t mask = l == 8 ? ~uint64_t{0} : ((uint64_t{1} << (8 * l)) - 1);
-                    if (l <= remaining && (win & mask) == sym) {
-                        code = long_code[slot];
-                        mlen = l;
-                    }
-                    break;
-                }
+        uint64_t code;
+        uint32_t n;
+        pos += match_at(load_window(in, pos), end - pos, t, code, n);
+        w.put(code, n);
+        written += n;
+    }
+    w.finish();
+    return written;
+}
+
+// Tiled encoding: one warp encodes 32 consecutive ranges (lane i: range i), in
+// steps of kTile input bytes per lane. Each step, the warp loads every lane's
+// next kTile + 16 bytes into a shared-memory row with coalesced 4-byte loads,
+// then every lane matches from its own row. Range starts must be multiples of 4,
+// and the input needs kTile + 16 bytes of slack.
+constexpr uint32_t kTile = 64;
+constexpr uint32_t kRowBytes = kTile + 24;  // 88: room for the look-ahead, 8-byte aligned
+
+__device__ __forceinline__ uint64_t row_window(const uint8_t* row, uint32_t off) {
+    const uint64_t* words = reinterpret_cast<const uint64_t*>(row + (off & ~7u));
+    const uint32_t shift = (off & 7u) * 8;
+    const uint64_t lo = words[0];
+    if (shift == 0) return lo;
+    return (lo >> shift) | (words[1] << (64 - shift));
+}
+
+// Output is interleaved: word j of the lane goes to out_start + j * 256 (the
+// lanes of a warp have consecutive 8-byte slots), so the stores of a warp land
+// next to each other.
+__device__ __forceinline__ uint32_t encode_range_tiled(const uint8_t* __restrict__ in, const Range& r,
+                                                       const EncodeTables& t, uint8_t* __restrict__ out,
+                                                       uint8_t* __restrict__ rows /* 32 * kRowBytes */) {
+    const uint32_t lane = threadIdx.x & 31u;
+    uint32_t max_len = r.in_len;
+#pragma unroll
+    for (int d = 16; d > 0; d >>= 1) max_len = max(max_len, __shfl_xor_sync(0xffffffffu, max_len, d));
+    StridedWriter<32> w{reinterpret_cast<uint64_t*>(out + r.out_start), 0, 0};
+    uint32_t written = 0;
+    uint32_t pos = 0;  // relative to the range start
+    uint8_t* my_row = rows + lane * kRowBytes;
+    for (uint32_t base = 0; base < max_len; base += kTile) {
+        // Load kTile + 16 bytes of every lane's range, one lane's row at a time.
+        for (uint32_t src = 0; src < 32; ++src) {
+            const uint64_t start = __shfl_sync(0xffffffffu, r.in_start, src);
+            if (lane < (kTile + 16) / 4) {
+                const uint32_t v = __ldg(reinterpret_cast<const uint32_t*>(in + start + base) + lane);
+                reinterpret_cast<uint32_t*>(rows + src * kRowBytes)[lane] = v;
             }
         }
-        if (mlen == 0 && remaining >= 2) {
-            const uint32_t key = static_cast<uint32_t>(win & 0xFFFFu);
-            for (uint32_t slot = hash_slot(key);; slot = (slot + 1) & (kTwoSlots - 1)) {
-                const uint32_t e = two[slot];
-                if (e == 0) break;
-                if ((e & 0xFFFFu) == key) {
-                    code = (e >> 16) & 0xFFu;
-                    mlen = 2;
-                    break;
-                }
-            }
+        __syncwarp();
+        // A match may run up to 7 bytes past the tile; the next tile starts there.
+        const uint32_t tile_end = min(base + kTile, r.in_len);
+        while (pos < tile_end) {
+            uint64_t code;
+            uint32_t n;
+            pos += match_at(row_window(my_row, pos - base), r.in_len - pos, t, code, n);
+            w.put(code, n);
+            written += n;
         }
-        if (mlen == 0) {
-            const uint32_t b = static_cast<uint32_t>(win & 0xFFu);
-            const uint32_t c = byte_code[b];
-            if (c != 255u) {
-                code = c;
-                mlen = 1;
-            } else {
-                // Escape + literal.
-                w.put(0xFFu | (static_cast<uint64_t>(b) << 8), 2);
-                written += 2;
-                pos += 1;
-                continue;
-            }
-        }
-        w.put(code, 1);
-        written += 1;
-        pos += mlen;
+        __syncwarp();
     }
     w.finish();
     return written;
