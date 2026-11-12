@@ -7,6 +7,7 @@
 //!   for `presst-colbench` (see `data/mod.rs`).
 //! * `e2e-dicts -o <dir> <parquet>...`: train one dictionary per string
 //!   column for the end-to-end benchmarks (see `e2e.rs`).
+//! * `e2ereport <results dir>`: summarize the end-to-end benchmark results.
 
 // Internal tool: module items are `pub` for readability, file names are ours.
 #![allow(
@@ -19,6 +20,7 @@
 mod colreport;
 mod data;
 mod e2e;
+mod e2ereport;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -36,6 +38,7 @@ fn main() -> Result<()> {
         )),
         Some("colreport") => colreport::run(&args[1..]),
         Some("e2e-dicts") => e2e::run(&args[1..]),
+        Some("e2ereport") => e2ereport::run(&args[1..]),
         Some("data") => match args.get(1).map(String::as_str) {
             Some("loghub") => data::loghub::run(),
             Some("clickbench") => data::clickbench::run(),
