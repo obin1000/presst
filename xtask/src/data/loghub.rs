@@ -92,7 +92,7 @@ fn read_lines(path: &Path) -> Result<Vec<Vec<u8>>> {
         let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
         for i in 0..zip.len() {
             let entry = zip.by_index(i)?;
-            let n = entry.name().to_owned();
+            let n = entry.name()?.into_owned();
             if n.ends_with(".log") && !n.contains("preprocessed") {
                 files.push((n, read_all(entry)?));
             }
