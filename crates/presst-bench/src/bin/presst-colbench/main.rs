@@ -201,7 +201,7 @@ struct Row<'a> {
     column: &'a str,
     /// Training level of this codec's dictionary, or "self"/"none".
     train_level: &'a str,
-    /// "full", "dedup" or "subset<k>".
+    /// "full", "dedup" or "`subset<k>`".
     variant: &'a str,
     timed: bool,
     train_bytes: usize,
