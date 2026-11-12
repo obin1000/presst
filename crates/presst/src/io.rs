@@ -3,7 +3,7 @@
 use std::io::{self, Read, Write};
 use std::vec::Vec;
 
-use crate::frame::{self, BLOCK_HEADER_LEN, BlockHeader, ContentHasher, FLAG_CONTENT_SIZE, FrameHeader, FrameOptions};
+use crate::frame::{self, BLOCK_HEADER_LEN, BlockHeader, ContentHasher, FrameHeader, FrameOptions};
 use crate::{Compressor, Decompressor, Error};
 
 /// Compresses a byte stream into a frame, one block at a time.
@@ -31,6 +31,7 @@ pub struct FrameWriter<W: Write> {
     comp: Compressor,
     inner: W,
     block_size: usize,
+    split_size: Option<usize>,
     buf: Vec<u8>,
     out: Vec<u8>,
     hasher: Option<ContentHasherDebug>,
@@ -50,12 +51,14 @@ impl<W: Write> FrameWriter<W> {
     /// not known up front.
     pub fn new(comp: Compressor, inner: W, options: FrameOptions) -> Self {
         let block_size = options.block_size();
+        let split_size_log2 = options.split_size_log2();
         let header = FrameHeader {
             scheme: comp.scheme(),
-            block_size_log2: block_size.trailing_zeros() as u8,
+            block_size_log2: options.block_size_log2(),
             dict_id: comp.dict_id(),
             checksum: options.checksum,
             content_size: None,
+            split_size_log2,
         };
         let mut out = Vec::new();
         header.write(&mut out);
@@ -63,6 +66,7 @@ impl<W: Write> FrameWriter<W> {
             comp,
             inner,
             block_size,
+            split_size: split_size_log2.map(|s| 1usize << s),
             buf: Vec::with_capacity(block_size),
             out,
             hasher: options.checksum.then(|| ContentHasherDebug(ContentHasher::new())),
@@ -71,7 +75,7 @@ impl<W: Write> FrameWriter<W> {
 
     /// Writes the last block and the checksum, flushes, and returns the inner writer.
     pub fn finish(mut self) -> io::Result<W> {
-        frame::write_block(&self.comp, &self.buf, true, &mut self.out);
+        frame::write_block(&self.comp, &self.buf, true, self.split_size, &mut self.out);
         if let Some(h) = &self.hasher {
             self.out.extend_from_slice(&h.0.finish().to_le_bytes());
         }
@@ -89,6 +93,7 @@ impl<W: Write> FrameWriter<W> {
                 &self.comp,
                 &self.buf[start..start + self.block_size],
                 false,
+                self.split_size,
                 &mut self.out,
             );
             start += self.block_size;
@@ -148,14 +153,12 @@ impl<R: Read> core::fmt::Debug for FrameReader<R> {
 impl<R: Read> FrameReader<R> {
     /// Reads and validates the frame header.
     pub fn new(dec: Decompressor, mut inner: R) -> io::Result<Self> {
-        let mut head = [0u8; 24];
+        let mut head = [0u8; 25];
         inner.read_exact(&mut head[..16])?;
-        let len = if head[5] & FLAG_CONTENT_SIZE != 0 {
-            inner.read_exact(&mut head[16..24])?;
-            24
-        } else {
-            16
-        };
+        let mut prefix = [0u8; 16];
+        prefix.copy_from_slice(&head[..16]);
+        let len = FrameHeader::len_from_prefix(&prefix);
+        inner.read_exact(&mut head[16..len])?;
         let (header, _) = FrameHeader::parse(&head[..len])?;
         if header.scheme != dec.scheme() {
             return Err(Error::Corrupt("frame scheme does not match dictionary").into());
@@ -188,7 +191,7 @@ impl<R: Read> FrameReader<R> {
     fn next_block(&mut self) -> io::Result<()> {
         let mut bh = [0u8; BLOCK_HEADER_LEN];
         self.inner.read_exact(&mut bh)?;
-        let bh = BlockHeader::parse(bh, &self.header, self.dec.max_expansion())?;
+        let bh = BlockHeader::parse(bh, &self.header)?;
         self.block.clear();
         self.pos = 0;
         if bh.raw {
@@ -197,8 +200,15 @@ impl<R: Read> FrameReader<R> {
         } else {
             self.scratch.resize(bh.csize, 0);
             self.inner.read_exact(&mut self.scratch)?;
-            self.dec
-                .decompress_block_into(&self.scratch, bh.dsize, &mut self.block)?;
+            // Validate the block on its own (split index included) and decode it.
+            let info = frame::block_info(&self.header, &bh, &self.scratch, 0, 0)?;
+            frame::decode_block(
+                &self.dec,
+                &self.scratch,
+                &info,
+                self.header.split_size(),
+                &mut self.block,
+            )?;
         }
         if let Some(h) = &mut self.hasher {
             h.update(&self.block);

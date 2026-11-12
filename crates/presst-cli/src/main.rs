@@ -109,6 +109,10 @@ struct CodecArgs {
     /// Omit the content checksum (compress only).
     #[arg(long)]
     no_checksum: bool,
+    /// Write a split index with splits of 2^N bytes, for GPU and multi-threaded
+    /// decoding (compress only; format version 2).
+    #[arg(long, value_name = "N")]
+    split_size_log2: Option<u8>,
 }
 
 fn main() -> Result<()> {
@@ -213,6 +217,7 @@ fn cmd_compress(args: &CodecArgs) -> Result<()> {
         block_size_log2: args.block_size_log2,
         checksum: !args.no_checksum,
         content_size: false,
+        split_size_log2: args.split_size_log2,
     };
     let mut input = open_input(&args.input)?;
     let mut writer = FrameWriter::new(Compressor::new(&dict)?, open_output(&args.output)?, opts);

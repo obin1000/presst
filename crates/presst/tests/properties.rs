@@ -83,10 +83,10 @@ proptest! {
     }
 
     #[test]
-    fn frame_roundtrip((dict, input) in dict_and_input(), checksum: bool, content_size: bool) {
+    fn frame_roundtrip((dict, input) in dict_and_input(), checksum: bool, content_size: bool, split in prop::option::of(8u8..=10)) {
         let comp = Compressor::new(&dict).unwrap();
         let dec = Decompressor::new(&dict).unwrap();
-        let opts = FrameOptions { block_size_log2: 10, checksum, content_size };
+        let opts = FrameOptions { block_size_log2: 10, checksum, content_size, split_size_log2: split };
         let frame = comp.compress_with(&input, opts);
         prop_assert_eq!(dec.decompress(&frame).unwrap(), input);
     }
@@ -130,10 +130,10 @@ proptest! {
     }
 
     #[test]
-    fn corrupted_frames_never_panic((dict, input) in dict_and_input(), flips in prop::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 1..4)) {
+    fn corrupted_frames_never_panic((dict, input) in dict_and_input(), flips in prop::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 1..4), split in prop::option::of(8u8..=10)) {
         let comp = Compressor::new(&dict).unwrap();
         let dec = Decompressor::new(&dict).unwrap();
-        let mut frame = comp.compress_with(&input, FrameOptions { block_size_log2: 10, ..FrameOptions::default() });
+        let mut frame = comp.compress_with(&input, FrameOptions { block_size_log2: 10, split_size_log2: split, ..FrameOptions::default() });
         for (idx, x) in flips {
             let i = idx.index(frame.len());
             frame[i] ^= x;

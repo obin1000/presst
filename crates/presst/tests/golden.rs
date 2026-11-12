@@ -73,10 +73,26 @@ fn frame_format() {
         block_size_log2: 10,
         checksum: true,
         content_size: true,
+        split_size_log2: None,
     };
     let frame = Compressor::new(&dict).unwrap().compress_with(TEXT, opts);
     check("frame-v1.prs", &frame);
     let golden = std::fs::read(golden_dir().join("frame-v1.prs")).unwrap();
+    assert_eq!(Decompressor::new(&dict).unwrap().decompress(&golden).unwrap(), TEXT);
+}
+
+#[test]
+fn frame_format_with_split_index() {
+    let dict = dictionary();
+    let opts = FrameOptions {
+        block_size_log2: 10,
+        checksum: true,
+        content_size: true,
+        split_size_log2: Some(8),
+    };
+    let frame = Compressor::new(&dict).unwrap().compress_with(TEXT, opts);
+    check("frame-v2.prs", &frame);
+    let golden = std::fs::read(golden_dir().join("frame-v2.prs")).unwrap();
     assert_eq!(Decompressor::new(&dict).unwrap().decompress(&golden).unwrap(), TEXT);
 }
 
