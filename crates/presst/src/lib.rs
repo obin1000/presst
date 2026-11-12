@@ -61,7 +61,10 @@ mod util;
 pub use codec::{Compressor, Decompressor};
 pub use dict::{DictId, Dictionary, DictionaryBuilder, Metadata, PushError};
 pub use error::{Error, Result};
-pub use frame::{DEFAULT_BLOCK_SIZE_LOG2, FrameHeader, FrameOptions, MAX_BLOCK_SIZE_LOG2, MIN_BLOCK_SIZE_LOG2};
+pub use frame::{
+    BlockInfo, DEFAULT_BLOCK_SIZE_LOG2, DEFAULT_SPLIT_SIZE_LOG2, FrameHeader, FrameIndex, FrameOptions,
+    MAX_BLOCK_SIZE_LOG2, MIN_BLOCK_SIZE_LOG2, MIN_SPLIT_SIZE_LOG2, block_header,
+};
 pub use registry::Registry;
 pub use scheme::Scheme;
-pub use strings::StringBatch;
+pub use strings::{STRING_GROUP_SIZE_LOG2, StringBatch, StringOptions};

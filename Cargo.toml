@@ -6,6 +6,7 @@ members = [
     "crates/presst-train",
     "crates/presst-cli",
     "crates/presst-bench",
+    "crates/presst-cuda",
     "xtask",
 ]
 default-members = ["crates/presst", "crates/presst-train", "crates/presst-cli"]

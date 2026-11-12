@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use presst::{Compressor, Decompressor, Dictionary, FrameOptions, Metadata, Scheme, StringBatch};
+use presst::{Compressor, Decompressor, Dictionary, FrameOptions, Metadata, Scheme, StringBatch, StringOptions};
 
 fn golden_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("golden")
@@ -73,10 +73,26 @@ fn frame_format() {
         block_size_log2: 10,
         checksum: true,
         content_size: true,
+        split_size_log2: None,
     };
     let frame = Compressor::new(&dict).unwrap().compress_with(TEXT, opts);
     check("frame-v1.prs", &frame);
     let golden = std::fs::read(golden_dir().join("frame-v1.prs")).unwrap();
+    assert_eq!(Decompressor::new(&dict).unwrap().decompress(&golden).unwrap(), TEXT);
+}
+
+#[test]
+fn frame_format_with_split_index() {
+    let dict = dictionary();
+    let opts = FrameOptions {
+        block_size_log2: 10,
+        checksum: true,
+        content_size: true,
+        split_size_log2: Some(8),
+    };
+    let frame = Compressor::new(&dict).unwrap().compress_with(TEXT, opts);
+    check("frame-v2.prs", &frame);
+    let golden = std::fs::read(golden_dir().join("frame-v2.prs")).unwrap();
     assert_eq!(Decompressor::new(&dict).unwrap().decompress(&golden).unwrap(), TEXT);
 }
 
@@ -89,6 +105,20 @@ fn batch_format() {
     check("batch-v1.prsc", &batch.to_bytes());
     let golden = std::fs::read(golden_dir().join("batch-v1.prsc")).unwrap();
     let parsed = StringBatch::from_bytes(&golden).unwrap();
+    let (all, _) = Decompressor::new(&dict).unwrap().decompress_strings(&parsed).unwrap();
+    assert_eq!(all, TEXT.iter().copied().filter(|&b| b != b' ').collect::<Vec<_>>());
+}
+
+#[test]
+fn batch_format_with_decoded_index() {
+    let dict = dictionary();
+    let batch = Compressor::new(&dict)
+        .unwrap()
+        .compress_strings_with(TEXT.split(|&b| b == b' '), StringOptions { decoded_index: true });
+    check("batch-v2.prsc", &batch.to_bytes());
+    let golden = std::fs::read(golden_dir().join("batch-v2.prsc")).unwrap();
+    let parsed = StringBatch::from_bytes(&golden).unwrap();
+    assert!(parsed.decoded_index().is_some());
     let (all, _) = Decompressor::new(&dict).unwrap().decompress_strings(&parsed).unwrap();
     assert_eq!(all, TEXT.iter().copied().filter(|&b| b != b' ').collect::<Vec<_>>());
 }

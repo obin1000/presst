@@ -8,7 +8,7 @@ use core::fmt;
 
 use self::u8::{U8Decoder, U8Encoder};
 use crate::frame::{self, FrameOptions};
-use crate::strings::StringBatch;
+use crate::strings::{StringBatch, StringOptions};
 use crate::{DictId, Dictionary, Error, Result, Scheme};
 
 /// Encoder tables per scheme. Dispatch happens once per call, never per byte.
@@ -118,15 +118,37 @@ impl Compressor {
         I: IntoIterator<Item = S>,
         S: AsRef<[u8]>,
     {
+        self.compress_strings_with(strings, StringOptions::default())
+    }
+
+    /// Like [`compress_strings`](Self::compress_strings), with options (for
+    /// example a decoded index for GPU decoding).
+    ///
+    /// # Panics
+    /// Panics if the total compressed size exceeds `u32::MAX` bytes.
+    pub fn compress_strings_with<I, S>(&self, strings: I, options: StringOptions) -> StringBatch
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<[u8]>,
+    {
         let iter = strings.into_iter();
         let mut codes = Vec::new();
         let mut offsets = Vec::with_capacity(iter.size_hint().0 + 1);
+        let mut decoded_lens = Vec::new();
         offsets.push(0);
         for s in iter {
-            self.compress_block_into(s.as_ref(), &mut codes);
+            let s = s.as_ref();
+            self.compress_block_into(s, &mut codes);
             offsets.push(u32::try_from(codes.len()).expect("string batch larger than 4 GiB"));
+            if options.decoded_index {
+                decoded_lens.push(s.len());
+            }
         }
-        StringBatch::from_parts(self.inner.id, codes, offsets)
+        let mut batch = StringBatch::from_parts(self.inner.id, codes, offsets);
+        if options.decoded_index {
+            batch.set_decoded_index(&decoded_lens);
+        }
+        batch
     }
 }
 
@@ -231,6 +253,17 @@ impl Decompressor {
             let codes = batch.codes(i).ok_or(Error::Corrupt("string index out of range"))?;
             self.decompress_codes_into(codes, &mut data)?;
             offsets.push(u32::try_from(data.len()).map_err(|_| Error::Corrupt("decoded batch larger than 4 GiB"))?);
+        }
+        // A stored decoded index must match what the strings decode to.
+        if let Some((g, starts)) = batch.decoded_index() {
+            let g = 1usize << g;
+            let ok = starts
+                .iter()
+                .enumerate()
+                .all(|(k, &s)| u64::from(offsets[(k * g).min(batch.len())]) == s);
+            if !ok {
+                return Err(Error::Corrupt("decoded index does not match the strings"));
+            }
         }
         Ok((data, offsets))
     }

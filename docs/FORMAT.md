@@ -1,6 +1,6 @@
 # presst binary formats
 
-Status: **unstable** (version 1, pre-1.0). Readers reject unknown versions. All
+Status: **unstable** (pre-1.0). Readers reject unknown versions. All
 integers are little-endian. `xxh3` means XXH3-64 with seed 0.
 
 There are three formats:
@@ -21,7 +21,6 @@ dictionaries and frames.
 | 0 | `U8` | Implemented |
 | 1 | `U16` | Reserved |
 | 2 | `Hybrid8x16` | Reserved |
-| 3 | `U12` | Reserved |
 
 ### U8 (FSST-compatible)
 
@@ -74,12 +73,13 @@ end-8   8         xxh3 of all preceding bytes
 ```
 offset  size  field
 0       4     magic "PRST"
-4       1     format version = 1
+4       1     format version: 1, or 2 if flag SPLIT_INDEX is set
 5       1     flags
 6       1     scheme
 7       1     block size log2 (10..=26)
 8       8     dictionary id
-16      8     content size (only if flag CONTENT_SIZE)
+        8     content size (only if flag CONTENT_SIZE)
+        1     split size log2 (8..=block size log2; only if flag SPLIT_INDEX)
         ...   blocks, until a block with the LAST bit
         8     xxh3 of the decompressed content (only if flag CHECKSUM)
 ```
@@ -90,6 +90,7 @@ offset  size  field
 | `CONTENT_SIZE` | 1 | Content size stored in the header |
 | `DICT_INLINE` | 2 | Reserved: dictionary stored in the frame |
 | `MULTI_DICT` | 3 | Reserved: several dictionaries, one chosen per block |
+| `SPLIT_INDEX` | 4 | Coded blocks start with a split index (version 2 only) |
 
 Readers reject frames with flags they don't support.
 
@@ -104,7 +105,8 @@ size  field
 csize payload
 ```
 
-- A **coded** block's payload is a code stream that decodes to exactly `dsize` bytes.
+- A **coded** block's payload is a code stream that decodes to exactly `dsize` bytes. With
+  `SPLIT_INDEX`, the payload starts with a split index instead (below).
 - A **raw** block stores the data as is; `csize == dsize`.
 
 **Decoder checks:**
@@ -112,6 +114,28 @@ csize payload
 - For coded blocks, `dsize <= csize * max_expansion` (8 for U8). This bounds memory use by the input size.
 - The sum of `dsize` equals the content size, if stored.
 - No bytes after the frame.
+
+### Split index (version 2)
+
+With `SPLIT_INDEX`, the input of every coded block is cut into splits of `split size` bytes
+(the last one holds the rest), and each split is encoded on its own: greedy matching restarts at
+every split boundary. The payload of a coded block is then:
+
+```
+size        field
+4 * s       end offset of each split's codes, relative to the start of the codes (u32)
+rest        codes of split 0, split 1, ...
+```
+
+where `s = ceil(dsize / split size)`. Split `i` decodes the codes between `end[i-1]` (0 for the
+first) and `end[i]` to exactly `min(split size, dsize - i * split size)` bytes, at decoded
+offset `i * split size` within the block. Every split can therefore be decoded independently
+at a known position, by many GPU threads or CPU cores.
+
+**Additional decoder checks:** the offsets are non-decreasing, the last one equals the length of
+the codes, and every split can decode to its size (`split dsize <= split codes * 8`).
+
+Raw blocks have no split index. A version 1 reader rejects version 2 frames.
 
 **Writers:**
 - Every block except the last holds exactly one block size of data.
@@ -131,3 +155,25 @@ rest        code bytes: the U8 code streams of all strings, concatenated
 ```
 
 String `i` is the code stream `codes[offsets[i]..offsets[i+1]]`.
+
+### Decoded index (version 2)
+
+Version 2 batches also store where each group of strings starts in the decoded output, so GPU
+and multi-threaded decoders can decode groups independently:
+
+```
+size        field
+4           magic "PRSC"
+1           version = 2
+8           dictionary id
+4           string count n
+1           group size log2 g (1..=16; writers use 5, one GPU warp of 32 strings)
+4 * (n+1)   offsets into the code bytes, as in version 1
+8 * (k+1)   decoded start of strings 0, 2^g, 2*2^g, ... (k = ceil(n / 2^g) groups),
+            followed by the total decoded size
+rest        code bytes
+```
+
+**Decoder checks:** the first start is 0, starts are non-decreasing, and a group's decoded size
+is at most 8 times its code bytes. Decoders that decode the whole batch check that the strings
+decode to exactly these starts.

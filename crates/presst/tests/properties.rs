@@ -1,7 +1,10 @@
 //! Property tests: the fast kernels must match the reference implementation,
 //! round-trip any input, and never panic on arbitrary data.
 
-use presst::{Compressor, Decompressor, Dictionary, DictionaryBuilder, FrameOptions, Scheme, StringBatch, reference};
+use presst::{
+    Compressor, Decompressor, Dictionary, DictionaryBuilder, FrameOptions, Scheme, StringBatch, StringOptions,
+    reference,
+};
 use proptest::prelude::*;
 
 /// A small alphabet makes symbols actually match the generated inputs.
@@ -83,19 +86,22 @@ proptest! {
     }
 
     #[test]
-    fn frame_roundtrip((dict, input) in dict_and_input(), checksum: bool, content_size: bool) {
+    fn frame_roundtrip((dict, input) in dict_and_input(), checksum: bool, content_size: bool, split in prop::option::of(8u8..=10)) {
         let comp = Compressor::new(&dict).unwrap();
         let dec = Decompressor::new(&dict).unwrap();
-        let opts = FrameOptions { block_size_log2: 10, checksum, content_size };
+        let opts = FrameOptions { block_size_log2: 10, checksum, content_size, split_size_log2: split };
         let frame = comp.compress_with(&input, opts);
         prop_assert_eq!(dec.decompress(&frame).unwrap(), input);
     }
 
     #[test]
-    fn strings_roundtrip(dict in dictionary(), strings in prop::collection::vec(prop::collection::vec(alphabet_byte(), 0..40), 0..50)) {
+    fn strings_roundtrip(dict in dictionary(), strings in prop::collection::vec(prop::collection::vec(alphabet_byte(), 0..40), 0..80), indexed: bool) {
         let comp = Compressor::new(&dict).unwrap();
         let dec = Decompressor::new(&dict).unwrap();
-        let batch = comp.compress_strings(&strings);
+        let batch = comp.compress_strings_with(&strings, StringOptions { decoded_index: indexed });
+        let (all, offsets) = dec.decompress_strings(&batch).unwrap();
+        prop_assert_eq!(all, strings.concat());
+        prop_assert_eq!(offsets.len(), strings.len() + 1);
         let batch = StringBatch::from_bytes(&batch.to_bytes()).unwrap();
         for (i, s) in strings.iter().enumerate() {
             let mut out = Vec::new();
@@ -130,10 +136,10 @@ proptest! {
     }
 
     #[test]
-    fn corrupted_frames_never_panic((dict, input) in dict_and_input(), flips in prop::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 1..4)) {
+    fn corrupted_frames_never_panic((dict, input) in dict_and_input(), flips in prop::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 1..4), split in prop::option::of(8u8..=10)) {
         let comp = Compressor::new(&dict).unwrap();
         let dec = Decompressor::new(&dict).unwrap();
-        let mut frame = comp.compress_with(&input, FrameOptions { block_size_log2: 10, ..FrameOptions::default() });
+        let mut frame = comp.compress_with(&input, FrameOptions { block_size_log2: 10, split_size_log2: split, ..FrameOptions::default() });
         for (idx, x) in flips {
             let i = idx.index(frame.len());
             frame[i] ^= x;

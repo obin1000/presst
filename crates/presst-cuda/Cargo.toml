@@ -1,0 +1,28 @@
+[package]
+name = "presst-cuda"
+description = "CUDA GPU backend for presst: decode and encode on NVIDIA GPUs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["compression", "fsst", "gpu", "cuda", "string"]
+categories = ["compression"]
+publish = false
+
+[dependencies]
+presst = { workspace = true, features = ["std"] }
+# Driver API only, loaded at runtime (no link-time CUDA dependency). The
+# bindings are for CUDA 12.6; newer drivers stay compatible.
+cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-12060"] }
+xxhash-rust = { workspace = true }
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true
