@@ -328,3 +328,95 @@ fn device_rejects_bad_offsets() {
             .is_err()
     );
 }
+
+// --- Vortex FSST kernels --------------------------------------------------------
+
+/// Vortex's 16-byte view for `bytes` at `start` (inline up to 12 bytes).
+fn vortex_view(bytes: &[u8], start: u64) -> [u32; 4] {
+    let len = bytes.len() as u32;
+    if bytes.len() <= 12 {
+        let mut w = [0u32; 3];
+        for (i, &b) in bytes.iter().enumerate() {
+            w[i / 4] |= u32::from(b) << (8 * (i % 4));
+        }
+        [len, w[0], w[1], w[2]]
+    } else {
+        [
+            len,
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            0,
+            start as u32,
+        ]
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: cases() / 2 + 1, ..ProptestConfig::default() })]
+
+    #[test]
+    fn vortex_kernels_match_cpu(
+        (dict, strings) in dict_and_strings(),
+        nulls in prop::collection::vec(any::<bool>(), 300),
+        odd_null: bool,
+        bit_offset in 0u64..8,
+    ) {
+        let Some(gpu) = gpu() else { return Ok(()) };
+        let dict = dict.to_fsst_order();
+        let comp = Compressor::new(&dict).unwrap();
+        // Vortex compresses nulls as empty code streams of decoded length 0.
+        let n = strings.len();
+        let is_null = |i: usize| nulls[i % nulls.len()] && i % 3 == 0;
+        let mut codes = Vec::new();
+        let mut code_offsets = vec![0u32];
+        let mut output_offsets = vec![0u64];
+        let mut validity = vec![0u8; (n + 8).div_ceil(8) + 1];
+        for (i, s) in strings.iter().enumerate() {
+            let null = is_null(i);
+            let bit = i as u64 + bit_offset;
+            if null {
+                // Optionally a null with codes and a length, which the warp
+                // kernel handles with its per-string fallback.
+                if odd_null && i == 0 {
+                    comp.compress_block_into(b"abc", &mut codes);
+                    output_offsets.push(output_offsets[i] + 3);
+                } else {
+                    output_offsets.push(output_offsets[i]);
+                }
+            } else {
+                validity[(bit / 8) as usize] |= 1 << (bit % 8);
+                comp.compress_block_into(s, &mut codes);
+                output_offsets.push(output_offsets[i] + s.len() as u64);
+            }
+            code_offsets.push(codes.len() as u32);
+        }
+        let symbols: Vec<u64> = dict
+            .symbols()
+            .map(|s| {
+                let mut w = [0xAAu8; 8]; // unspecified high bytes
+                w[..s.len()].copy_from_slice(s);
+                u64::from_le_bytes(w)
+            })
+            .collect();
+        let array = presst_cuda::vortex::VortexFsst {
+            codes: &codes,
+            code_offsets: &code_offsets,
+            symbols: &symbols,
+            symbol_lengths: dict.symbol_lens(),
+            output_offsets: &output_offsets,
+            validity: &validity,
+            validity_bit_offset: bit_offset,
+        };
+        for kernel in [presst_cuda::vortex::VortexKernel::ThreadPerString, presst_cuda::vortex::VortexKernel::WarpPerGroup] {
+            let (bytes, views, _) = gpu.decode_vortex_fsst(&array, kernel).unwrap();
+            for (i, s) in strings.iter().enumerate() {
+                if is_null(i) {
+                    prop_assert_eq!(views[i], [0, 0, 0, 0]);
+                    continue;
+                }
+                let (a, b) = (output_offsets[i] as usize, output_offsets[i + 1] as usize);
+                prop_assert_eq!(&bytes[a..b], &s[..], "{:?} string {}", kernel, i);
+                prop_assert_eq!(views[i], vortex_view(s, output_offsets[i]), "{:?} view {}", kernel, i);
+            }
+        }
+    }
+}

@@ -6,7 +6,7 @@
 
 # Pinned forks (branch `presst` on each).
 : "${VORTEX_REPO:=https://github.com/obin1000/vortex.git}"
-: "${VORTEX_COMMIT:=1e0b38da0}"
+: "${VORTEX_COMMIT:=a3073bbb0}"
 : "${DUCKDB_REPO:=https://github.com/obin1000/duckdb.git}"
 : "${DUCKDB_COMMIT:=8ddcc2c8}"
 

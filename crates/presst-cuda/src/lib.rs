@@ -28,6 +28,7 @@
 mod device;
 mod encode;
 mod split;
+pub mod vortex;
 
 use std::fmt;
 use std::sync::Arc;
@@ -174,6 +175,8 @@ pub struct GpuContext {
     scan_blocks: CudaFunction,
     scan_sums: CudaFunction,
     scan_add: CudaFunction,
+    vortex_fsst_thread: CudaFunction,
+    vortex_fsst_warp: CudaFunction,
 }
 
 impl fmt::Debug for GpuContext {
@@ -261,6 +264,8 @@ impl GpuContext {
             scan_blocks: module.load_function("presst_scan_blocks")?,
             scan_sums: module.load_function("presst_scan_sums")?,
             scan_add: module.load_function("presst_scan_add")?,
+            vortex_fsst_thread: module.load_function("fsst_u32")?,
+            vortex_fsst_warp: module.load_function("fsst_warp_u32")?,
             gather: module.load_function("presst_gather")?,
             strings_shared: module.load_function("presst_decode_strings_shared")?,
             strings_global: module.load_function("presst_decode_strings_global")?,

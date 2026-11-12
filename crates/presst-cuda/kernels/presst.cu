@@ -295,3 +295,9 @@ presst_scan_add(uint64_t* __restrict__ out, uint32_t n, const uint64_t* __restri
         if (out32) out32[i] = static_cast<uint32_t>(v);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Vortex FSST kernels (see vortex/README.md): the warp decoder written for
+// Vortex, and Vortex's own thread-per-string decoder for comparison.
+#include "vortex/fsst.cu"
+#include "vortex/fsst_warp.cu"

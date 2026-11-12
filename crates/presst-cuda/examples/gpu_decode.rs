@@ -3,6 +3,7 @@
 //! ```sh
 //! cargo run --release -p presst-cuda --example gpu_decode -- <dict.pdict> <input> [split_log2] [runs]
 //! cargo run --release -p presst-cuda --example gpu_decode -- <dict.pdict> <input.vals> strings [runs]
+//! cargo run --release -p presst-cuda --example gpu_decode -- <dict.pdict> <input.vals> vortex [runs]
 //! ```
 //!
 //! `input` is either raw bytes or a `.vals` file (u32 length-prefixed values,
@@ -147,6 +148,61 @@ fn strings(dict: &Dictionary, path: &str, runs: usize) -> Result<(), Box<dyn std
     Ok(())
 }
 
+/// Vortex's FSST kernels on Vortex's layout (`BinaryView` output): Vortex's own
+/// thread-per-string decoder vs. the warp decoder written for Vortex.
+fn vortex(dict: &Dictionary, path: &str, runs: usize) -> Result<(), Box<dyn std::error::Error>> {
+    use presst_cuda::vortex::{VortexFsst, VortexKernel};
+    let dict = dict.to_fsst_order();
+    let values = read_values(path);
+    let comp = Compressor::new(&dict)?;
+    let mut codes = Vec::new();
+    let mut code_offsets = vec![0u32];
+    let mut output_offsets = vec![0u64];
+    for v in &values {
+        comp.compress_block_into(v, &mut codes);
+        code_offsets.push(codes.len() as u32);
+        output_offsets.push(output_offsets.last().copied().unwrap_or(0) + v.len() as u64);
+    }
+    let bytes = *output_offsets.last().unwrap_or(&0) as usize;
+    let symbols: Vec<u64> = dict
+        .symbols()
+        .map(|s| {
+            let mut w = [0u8; 8];
+            w[..s.len()].copy_from_slice(s);
+            u64::from_le_bytes(w)
+        })
+        .collect();
+    let validity = vec![0xFFu8; values.len().div_ceil(8) + 1];
+    let array = VortexFsst {
+        codes: &codes,
+        code_offsets: &code_offsets,
+        symbols: &symbols,
+        symbol_lengths: dict.symbol_lens(),
+        output_offsets: &output_offsets,
+        validity: &validity,
+        validity_bit_offset: 0,
+    };
+    let gb = bytes as f64 / 1e9;
+    println!(
+        "{} strings, {:.1} MB, codes {:.1} MB",
+        values.len(),
+        gb * 1e3,
+        codes.len() as f64 / 1e6
+    );
+    let gpu = GpuContext::new(0)?;
+    println!("GPU: {}", gpu.device_name()?);
+    for kernel in [VortexKernel::ThreadPerString, VortexKernel::WarpPerGroup] {
+        let mut best = f64::MAX;
+        for _ in 0..runs {
+            let (out, _, ms) = gpu.decode_vortex_fsst(&array, kernel)?;
+            best = best.min(f64::from(ms) / 1e3);
+            assert_eq!(out.len(), bytes);
+        }
+        println!("Vortex {kernel:?}: kernel {:.1} GB/s (bytes + views)", gb / best);
+    }
+    Ok(())
+}
+
 #[expect(clippy::too_many_lines, reason = "a linear benchmark script")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -155,6 +211,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(2);
     }
     let dict = Dictionary::from_bytes(&std::fs::read(&args[0])?)?;
+    if args.get(2).map(String::as_str) == Some("vortex") {
+        let runs: usize = args.get(3).map_or(Ok(10), |s| s.parse())?;
+        return vortex(&dict, &args[1], runs);
+    }
     if args.get(2).map(String::as_str) == Some("strings") {
         let runs: usize = args.get(3).map_or(Ok(10), |s| s.parse())?;
         return strings(&dict, &args[1], runs);

@@ -74,7 +74,7 @@ fn run_nvcc(nvcc: &Path, fatbin: &Path, allow_unsupported_compiler: bool) -> Res
     let newest = *archs.last().ok_or("PRESST_CUDA_ARCHS is empty")?;
     let mut cmd = Command::new(nvcc);
     cmd.arg("--fatbin")
-        .arg("-std=c++17")
+        .arg("-std=c++20")
         .arg("-O3")
         .arg("--restrict")
         .arg("-Ikernels")
