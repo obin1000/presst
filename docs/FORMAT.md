@@ -155,3 +155,25 @@ rest        code bytes: the U8 code streams of all strings, concatenated
 ```
 
 String `i` is the code stream `codes[offsets[i]..offsets[i+1]]`.
+
+### Decoded index (version 2)
+
+Version 2 batches also store where each group of strings starts in the decoded output, so GPU
+and multi-threaded decoders can decode groups independently:
+
+```
+size        field
+4           magic "PRSC"
+1           version = 2
+8           dictionary id
+4           string count n
+1           group size log2 g (1..=16; writers use 5, one GPU warp of 32 strings)
+4 * (n+1)   offsets into the code bytes, as in version 1
+8 * (k+1)   decoded start of strings 0, 2^g, 2*2^g, ... (k = ceil(n / 2^g) groups),
+            followed by the total decoded size
+rest        code bytes
+```
+
+**Decoder checks:** the first start is 0, starts are non-decreasing, and a group's decoded size
+is at most 8 times its code bytes. Decoders that decode the whole batch check that the strings
+decode to exactly these starts.

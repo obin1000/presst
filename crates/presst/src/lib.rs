@@ -67,4 +67,4 @@ pub use frame::{
 };
 pub use registry::Registry;
 pub use scheme::Scheme;
-pub use strings::StringBatch;
+pub use strings::{STRING_GROUP_SIZE_LOG2, StringBatch, StringOptions};

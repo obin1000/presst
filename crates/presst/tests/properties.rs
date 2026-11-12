@@ -1,7 +1,10 @@
 //! Property tests: the fast kernels must match the reference implementation,
 //! round-trip any input, and never panic on arbitrary data.
 
-use presst::{Compressor, Decompressor, Dictionary, DictionaryBuilder, FrameOptions, Scheme, StringBatch, reference};
+use presst::{
+    Compressor, Decompressor, Dictionary, DictionaryBuilder, FrameOptions, Scheme, StringBatch, StringOptions,
+    reference,
+};
 use proptest::prelude::*;
 
 /// A small alphabet makes symbols actually match the generated inputs.
@@ -92,10 +95,13 @@ proptest! {
     }
 
     #[test]
-    fn strings_roundtrip(dict in dictionary(), strings in prop::collection::vec(prop::collection::vec(alphabet_byte(), 0..40), 0..50)) {
+    fn strings_roundtrip(dict in dictionary(), strings in prop::collection::vec(prop::collection::vec(alphabet_byte(), 0..40), 0..80), indexed: bool) {
         let comp = Compressor::new(&dict).unwrap();
         let dec = Decompressor::new(&dict).unwrap();
-        let batch = comp.compress_strings(&strings);
+        let batch = comp.compress_strings_with(&strings, StringOptions { decoded_index: indexed });
+        let (all, offsets) = dec.decompress_strings(&batch).unwrap();
+        prop_assert_eq!(all, strings.concat());
+        prop_assert_eq!(offsets.len(), strings.len() + 1);
         let batch = StringBatch::from_bytes(&batch.to_bytes()).unwrap();
         for (i, s) in strings.iter().enumerate() {
             let mut out = Vec::new();
