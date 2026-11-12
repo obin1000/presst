@@ -1,0 +1,12 @@
+# ClickBench `hits` (https://github.com/ClickHouse/ClickBench), 10 of the 100 partitioned Parquet files,
+# spread over the dataset. Format: <checksum> <url>. Fetched by `cargo xtask data clickbench`.
+sha256:fa134fe101e68324e0de851146fda69624f5cbb707d387141d1c2a88a219a16d https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_0.parquet
+sha256:959aa46d139710d75af4cb30648bb9ca2c577f8e4b520858907079ced974bae0 https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_11.parquet
+sha256:c91b016661e9cfd26a6dcc5ec140ee1e38c91a2d4159d93b5da5391e6c92b4dd https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_22.parquet
+sha256:e830e05acb5e4c24aa2a47a3a636a1329a7a6e0946230e1f507dcf816ae31143 https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_33.parquet
+sha256:ffa0bf8af5c0d2471dfb461b2fed94526e8800e4385e3bdd04c9e53d4d83616f https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_44.parquet
+sha256:2c69ee143680de5c603e5b29382d3e911090312e9235f4c16f87395f2ea079f7 https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_55.parquet
+sha256:83faa3e51f7ee9f84ce4ef4056ef5f821a077ca64c3d1e1d4396e35696bb4dad https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_66.parquet
+sha256:269d82cb387c333e34c9420626d6d301b840d34d45126942fce9137e3b7cc488 https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_77.parquet
+sha256:59166c4f4ffa6fbb81b312018674ded76241a64379e89f6c15984930e33f8de3 https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_88.parquet
+sha256:9f2d7b7a75592fcbf97a9b6b8f86d7ece2dd68c71bf14c485ecfe7aad27fe31c https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_99.parquet

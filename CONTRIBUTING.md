@@ -60,3 +60,13 @@ cargo bench -p presst-bench              # microbenchmarks
 
 `presst-eval` trains on the first half of each file and measures on the
 second half, so dictionaries are never evaluated on their training data.
+
+The main benchmark runs on real string columns (about 3.5 GB of downloads,
+pinned by checksum in `corpora/*.sources`; see `docs/BENCHMARKS.md`):
+
+```sh
+cargo xtask data all
+cargo run --release -p presst-bench --bin presst-colbench -- --quick           # smoke run
+cargo run --release -p presst-bench --bin presst-colbench -- --json main.jsonl # full run, ~1.5 h
+cargo xtask colreport main.jsonl --svg chart.svg
+```

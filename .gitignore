@@ -7,3 +7,4 @@
 /results
 *.prs
 !/crates/presst/tests/golden/*.prs
+/corpora/download

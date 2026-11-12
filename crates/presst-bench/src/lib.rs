@@ -4,6 +4,9 @@
 
 #![allow(missing_debug_implementations)]
 
+pub mod column;
+pub mod vals;
+
 use std::mem::MaybeUninit;
 
 use presst::{Compressor, Decompressor, Dictionary};
@@ -220,7 +223,7 @@ impl Zstd {
 impl BlockCodec for Zstd {
     fn name(&self) -> String {
         match &self.dict {
-            Some(_) => format!("zstd -{} + dict (max {} KiB)", self.level, self.max_dict / 1024),
+            Some(_) => format!("zstd -{} +dict{}K", self.level, self.max_dict / 1024),
             None => format!("zstd -{}", self.level),
         }
     }

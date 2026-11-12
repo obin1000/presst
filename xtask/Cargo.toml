@@ -7,10 +7,18 @@ license.workspace = true
 publish = false
 
 [dependencies]
+presst-bench = { path = "../crates/presst-bench" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
+md-5 = "0.10"
+flate2 = "1"
+tar = "0.4"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+parquet = { version = "60", default-features = false, features = ["snap", "flate2", "flate2-rust_backend", "zstd", "lz4", "brotli"] }
+bzip2 = "0.6"
+csv = "1"
 
 [lints]
 workspace = true
