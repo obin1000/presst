@@ -146,6 +146,32 @@ impl Dictionary {
         Ok(b.build())
     }
 
+    /// The same symbols renumbered in FSST's code order: multi-byte symbols by
+    /// increasing length (2 to 8 bytes), then the 1-byte symbols. Within a
+    /// length the existing order is kept.
+    ///
+    /// Compressed output then uses the code numbering of FSST
+    /// implementations (fsst-rs, Vortex) that require this order, so their
+    /// decoders and compute kernels work on presst's code stream as is. The
+    /// [`DictId`] changes, because it depends on code order; the metadata is
+    /// kept.
+    ///
+    /// # Panics
+    /// Never: the same symbol set in another order satisfies the same
+    /// constraints.
+    #[must_use]
+    pub fn to_fsst_order(&self) -> Self {
+        let mut codes: Vec<usize> = (0..self.len()).collect();
+        codes.sort_by_key(|&c| match self.lens[c] {
+            1 => u8::MAX,
+            n => n,
+        });
+        // Same symbol set in a different order: every constraint still holds.
+        Self::from_symbols(self.scheme, codes.into_iter().map(|c| self.symbol(c)))
+            .expect("reordering keeps the dictionary valid")
+            .with_metadata(self.meta.clone())
+    }
+
     /// The code scheme of this dictionary.
     #[must_use]
     pub fn scheme(&self) -> Scheme {
@@ -466,6 +492,16 @@ mod tests {
             ..Metadata::default()
         });
         assert_eq!(a.id(), b.id());
+    }
+
+    #[test]
+    fn fsst_order() {
+        let d = Dictionary::from_symbols(Scheme::U8, [&b"abc"[..], b"x", b"ab", b"hello wo", b"y", b"cd"]).unwrap();
+        let f = d.to_fsst_order();
+        let symbols: Vec<&[u8]> = f.symbols().collect();
+        assert_eq!(symbols, [&b"ab"[..], b"cd", b"abc", b"hello wo", b"x", b"y"]);
+        assert_ne!(f.id(), d.id());
+        assert_eq!(f.to_fsst_order().id(), f.id());
     }
 
     #[test]
