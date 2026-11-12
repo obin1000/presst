@@ -4,7 +4,7 @@
 use std::sync::OnceLock;
 
 use presst::{Compressor, Decompressor, Dictionary, DictionaryBuilder, FrameOptions, Scheme};
-use presst_cuda::{GpuContext, GpuError, TablePlacement};
+use presst_cuda::{DecodeKernel, GpuContext, GpuError};
 use proptest::prelude::*;
 
 fn gpu() -> Option<&'static GpuContext> {
@@ -71,7 +71,7 @@ proptest! {
         let Some(gpu) = gpu() else { return Ok(()) };
         let frame = Compressor::new(&dict).unwrap().compress_with(&input, opts);
         let table = gpu.upload(&dict).unwrap();
-        for placement in [TablePlacement::Shared, TablePlacement::Global] {
+        for placement in DecodeKernel::ALL {
             prop_assert_eq!(&gpu.decompress_frame(&table, &frame, placement).unwrap(), &input);
         }
     }
@@ -90,7 +90,7 @@ proptest! {
         }
         let cpu = Decompressor::new(&dict).unwrap().decompress(&frame);
         let table = gpu.upload(&dict).unwrap();
-        let out = gpu.decompress_frame(&table, &frame, TablePlacement::Shared);
+        let out = gpu.decompress_frame(&table, &frame, DecodeKernel::default());
         match cpu {
             Ok(expected) => prop_assert_eq!(out.unwrap(), expected),
             Err(_) => prop_assert!(out.is_err()),
@@ -118,7 +118,7 @@ fn large_frame_and_errors() {
         },
     );
     let table = gpu.upload(&dict).unwrap();
-    for placement in [TablePlacement::Shared, TablePlacement::Global] {
+    for placement in DecodeKernel::ALL {
         assert_eq!(gpu.decompress_frame(&table, &frame, placement).unwrap(), input);
     }
     // The wrong dictionary is refused before any GPU work.
@@ -126,7 +126,7 @@ fn large_frame_and_errors() {
         .upload(&Dictionary::from_symbols(Scheme::U8, [&b"x"[..]]).unwrap())
         .unwrap();
     assert!(matches!(
-        gpu.decompress_frame(&other, &frame, TablePlacement::Shared),
+        gpu.decompress_frame(&other, &frame, DecodeKernel::default()),
         Err(GpuError::Format(presst::Error::DictionaryMismatch { .. }))
     ));
 }

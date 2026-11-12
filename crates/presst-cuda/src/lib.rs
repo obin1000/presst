@@ -8,7 +8,7 @@
 //!
 //! ```no_run
 //! use presst::{Compressor, Dictionary, FrameOptions, Scheme};
-//! use presst_cuda::{GpuContext, TablePlacement};
+//! use presst_cuda::{DecodeKernel, GpuContext};
 //!
 //! let dict = Dictionary::from_symbols(Scheme::U8, [&b"lorem "[..], b"ipsum "])?;
 //! let frame = Compressor::new(&dict)?.compress_with(
@@ -17,7 +17,7 @@
 //! );
 //! let gpu = GpuContext::new(0)?;
 //! let table = gpu.upload(&dict)?;
-//! assert_eq!(gpu.decompress_frame(&table, &frame, TablePlacement::Shared)?, b"lorem ipsum lorem ipsum");
+//! assert_eq!(gpu.decompress_frame(&table, &frame, DecodeKernel::default())?, b"lorem ipsum lorem ipsum");
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
@@ -105,13 +105,48 @@ pub fn is_available() -> bool {
         && CudaContext::device_count().is_ok_and(|n| n > 0)
 }
 
-/// Where the decode kernels read the 2.3 KB symbol table from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TablePlacement {
-    /// Copied into shared memory by every thread block.
-    Shared,
-    /// Read from global memory through the read-only (L1) cache.
-    Global,
+/// Which decode kernel to run, and where it reads the 2.3 KB symbol table
+/// from (shared memory, copied per thread block, or global memory through
+/// the read-only L1 cache).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DecodeKernel {
+    /// K1: one thread per split, table in shared memory.
+    ThreadShared,
+    /// K1: one thread per split, table through L1.
+    ThreadGlobal,
+    /// K2: one warp per split (coalesced code loads, warp scans, staged
+    /// 16-byte stores), table in shared memory.
+    WarpShared,
+    /// K2 with the table through L1.
+    #[default]
+    WarpGlobal,
+}
+
+impl DecodeKernel {
+    /// Every kernel variant.
+    pub const ALL: [Self; 4] = [
+        Self::ThreadShared,
+        Self::ThreadGlobal,
+        Self::WarpShared,
+        Self::WarpGlobal,
+    ];
+
+    fn symbol(self) -> &'static str {
+        match self {
+            Self::ThreadShared => "presst_decode_splits_shared",
+            Self::ThreadGlobal => "presst_decode_splits_global",
+            Self::WarpShared => "presst_decode_warp_shared",
+            Self::WarpGlobal => "presst_decode_warp_global",
+        }
+    }
+
+    /// Splits handled by one thread block of 256 threads.
+    fn splits_per_block(self) -> u32 {
+        match self {
+            Self::ThreadShared | Self::ThreadGlobal => DECODE_THREADS,
+            Self::WarpShared | Self::WarpGlobal => DECODE_THREADS / 32,
+        }
+    }
 }
 
 /// A GPU, a stream on it and the loaded kernels.
@@ -119,8 +154,8 @@ pub struct GpuContext {
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     _module: Arc<CudaModule>,
-    decode_shared: CudaFunction,
-    decode_global: CudaFunction,
+    /// Indexed like [`DecodeKernel::ALL`].
+    decode: Vec<CudaFunction>,
 }
 
 impl fmt::Debug for GpuContext {
@@ -186,8 +221,10 @@ impl GpuContext {
         let stream = ctx.default_stream();
         let module = ctx.load_module(Ptx::from_binary(FATBIN.to_vec()))?;
         Ok(Self {
-            decode_shared: module.load_function("presst_decode_splits_shared")?,
-            decode_global: module.load_function("presst_decode_splits_global")?,
+            decode: DecodeKernel::ALL
+                .iter()
+                .map(|k| module.load_function(k.symbol()))
+                .collect::<std::result::Result<_, _>>()?,
             _module: module,
             stream,
             ctx,
@@ -214,8 +251,8 @@ impl GpuContext {
     ///
     /// The frame is validated on the host first ([`FrameIndex::parse`]); the
     /// kernel checks the code streams. A stored checksum is verified.
-    pub fn decompress_frame(&self, dict: &GpuDictionary, frame: &[u8], placement: TablePlacement) -> Result<Vec<u8>> {
-        Ok(self.decompress_frame_timed(dict, frame, placement)?.0)
+    pub fn decompress_frame(&self, dict: &GpuDictionary, frame: &[u8], kernel: DecodeKernel) -> Result<Vec<u8>> {
+        Ok(self.decompress_frame_timed(dict, frame, kernel)?.0)
     }
 
     /// Like [`decompress_frame`](Self::decompress_frame), also returning the
@@ -224,7 +261,7 @@ impl GpuContext {
         &self,
         dict: &GpuDictionary,
         frame: &[u8],
-        placement: TablePlacement,
+        kernel: DecodeKernel,
     ) -> Result<(Vec<u8>, GpuTiming)> {
         let index = FrameIndex::parse(frame)?;
         if index.header.dict_id != dict.id {
@@ -238,7 +275,7 @@ impl GpuContext {
         let splits_dev = self.stream.clone_htod(&split::to_bytes(&splits))?;
         // 8 bytes of slack: the kernel writes whole aligned words.
         let mut out = self.stream.alloc_zeros::<u8>(index.content_size + 8)?;
-        let timing = self.launch_decode(dict, &input, &splits_dev, splits.len(), &mut out, placement)?;
+        let timing = self.launch_decode(dict, &input, &splits_dev, splits.len(), &mut out, kernel)?;
         let mut content = self.stream.clone_dtoh(&out)?;
         content.truncate(index.content_size);
         if let Some(expected) = index.checksum {
@@ -258,19 +295,16 @@ impl GpuContext {
         splits: &CudaSlice<u8>,
         n_splits: usize,
         out: &mut CudaSlice<u8>,
-        placement: TablePlacement,
+        kernel: DecodeKernel,
     ) -> Result<GpuTiming> {
         let mut error = self.stream.alloc_zeros::<u32>(1)?;
         if n_splits == 0 {
             return Ok(GpuTiming::default());
         }
         let n = u32::try_from(n_splits).map_err(|_| GpuError::Unavailable("too many splits for one launch"))?;
-        let func = match placement {
-            TablePlacement::Shared => &self.decode_shared,
-            TablePlacement::Global => &self.decode_global,
-        };
+        let func = &self.decode[DecodeKernel::ALL.iter().position(|k| *k == kernel).unwrap_or(0)];
         let cfg = LaunchConfig {
-            grid_dim: (n.div_ceil(DECODE_THREADS), 1, 1),
+            grid_dim: (n.div_ceil(kernel.splits_per_block()), 1, 1),
             block_dim: (DECODE_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
