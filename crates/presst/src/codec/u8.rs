@@ -34,15 +34,20 @@ struct HashEntry {
     len: u8,
 }
 
-/// Multipliers tried when searching for a collision-free hash function.
-const HASH_MULTIPLIERS: [u64; 6] = [
-    2_971_215_073,
-    0x9E37_79B9_7F4A_7C15,
-    0xC2B2_AE3D_27D4_EB4F,
-    0x1656_67B1_9E37_79F9,
-    0x27D4_EB2F_1656_67C5,
-    0xFF51_AFD7_ED55_8CCD,
-];
+/// Hash multipliers tried per table size when searching for a collision-free
+/// hash function. With up to 255 distinct keys, a table of 2^16 slots has no
+/// collision for about 60% of random multipliers, so the chance that all
+/// attempts fail is negligible (about 0.4^256).
+const HASH_ATTEMPTS: u32 = 256;
+
+/// The `i`-th candidate multiplier: a fixed pseudo-random odd sequence
+/// (`SplitMix64`), so the chosen hash function is deterministic.
+fn hash_multiplier(i: u32) -> u64 {
+    let mut z = 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(u64::from(i) + 1);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    (z ^ (z >> 31)) | 1
+}
 
 /// Prepared encoder tables for a U8 dictionary.
 pub(crate) struct U8Encoder {
@@ -185,9 +190,11 @@ fn build_hash(long: &[(u32, HashEntry)]) -> Result<(Box<[HashEntry]>, u64, u32)>
         if (1usize << bits) < long.len() * 2 {
             continue;
         }
-        for &mul in &HASH_MULTIPLIERS {
-            let shift = 64 - bits;
-            let mut table = vec![HashEntry::default(); 1 << bits].into_boxed_slice();
+        let shift = 64 - bits;
+        let mut table = vec![HashEntry::default(); 1 << bits].into_boxed_slice();
+        for attempt in 0..HASH_ATTEMPTS {
+            let mul = hash_multiplier(attempt);
+            table.fill(HashEntry::default());
             let ok = long.iter().all(|&(key, entry)| {
                 let slot = (key as u64).wrapping_mul(mul).wrapping_shr(shift) as usize;
                 if table[slot].len != 0 {
@@ -372,6 +379,42 @@ fn escape_mask(word: u64) -> u64 {
 mod tests {
     use super::*;
     use crate::{Scheme, reference};
+
+    /// Regression test: with only a few fixed multipliers, about 1 in 250
+    /// valid dictionaries with many long symbols could not build an encoder.
+    #[test]
+    fn hash_table_builds_for_random_key_sets() {
+        let mut state = 0x1234_5678_9ABC_DEF0u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..if cfg!(miri) { 2 } else { 2000 } {
+            let mut keys = alloc::collections::BTreeSet::new();
+            while keys.len() < 255 {
+                keys.insert((next() & 0x00FF_FFFF) as u32);
+            }
+            let long: Vec<(u32, HashEntry)> = keys
+                .iter()
+                .map(|&k| {
+                    (
+                        k,
+                        HashEntry {
+                            len: 3,
+                            ..HashEntry::default()
+                        },
+                    )
+                })
+                .collect();
+            let (table, mul, shift) = build_hash(&long).unwrap();
+            for &(key, _) in &long {
+                let slot = (u64::from(key)).wrapping_mul(mul).wrapping_shr(shift) as usize;
+                assert_eq!(table[slot].len, 3);
+            }
+        }
+    }
 
     #[test]
     fn escape_detection() {
