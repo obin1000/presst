@@ -184,11 +184,114 @@ presst_gather(const uint8_t* __restrict__ scratch,
               uint32_t word_stride) {
     const uint32_t warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     const uint32_t lane = threadIdx.x % 32;
-    const uint32_t warps = gridDim.x * blockDim.x / 32;
+    // At least one, so a launch with fewer than 32 threads cannot loop forever.
+    const uint32_t warps = max(1u, gridDim.x * blockDim.x / 32);
     for (uint32_t i = warp; i < n_ranges; i += warps) {
         const uint8_t* src = scratch + ranges[i].out_start;
         uint8_t* d = dst + dst_offsets[i];
         const uint32_t n = lens[i];
         for (uint32_t j = lane; j < n; j += 32) d[j] = src[(j >> 3) * word_stride + (j & 7)];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Device-resident helpers.
+
+// Encode ranges for strings given by n + 1 Arrow offsets (all on the device).
+// Range i reads [offsets[i], offsets[i+1]) and writes its codes (at most twice
+// the input) to scratch slot 8 * floor(2 * offsets[i] / 8) + 8 * i. Consecutive
+// slots are at least round_up(2 * len, 8) bytes apart, so they never overlap;
+// the scratch area needs 2 * offsets[n] + 8 * (n + 1) + 8 bytes.
+// Offsets that are not sorted or point past data_len set *error and produce an
+// empty range at 0, so nothing is read or written out of bounds.
+extern "C" __global__ void __launch_bounds__(256)
+presst_string_ranges(const uint32_t* __restrict__ offsets, uint32_t n, uint64_t data_len,
+                     Range* __restrict__ ranges, uint32_t* __restrict__ error) {
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        const uint64_t start = offsets[i];
+        const uint64_t end = offsets[i + 1];
+        Range r{0, 0, 0, 0};
+        if (end < start || end > data_len) {
+            atomicOr(error, 1u);
+        } else {
+            r.in_start = start;
+            r.in_len = static_cast<uint32_t>(end - start);
+            r.out_start = ((2 * start) & ~uint64_t{7}) + 8 * uint64_t{i};
+        }
+        ranges[i] = r;
+    }
+}
+
+// Exclusive prefix sum of n u32 values into n + 1 u64 values (the last is the
+// total), in three phases: scan within blocks of 1024, scan the block sums in
+// one block, add the block prefixes.
+constexpr uint32_t kScanBlock = 1024;
+
+__device__ __forceinline__ uint64_t block_exclusive_scan(uint64_t v, uint64_t* warp_sums, uint64_t& total) {
+    const uint32_t lane = threadIdx.x % 32;
+    const uint32_t warp = threadIdx.x / 32;
+    uint64_t incl = v;
+#pragma unroll
+    for (uint32_t d = 1; d < 32; d <<= 1) {
+        const uint64_t o = __shfl_up_sync(0xffffffffu, incl, d);
+        if (lane >= d) incl += o;
+    }
+    if (lane == 31) warp_sums[warp] = incl;
+    __syncthreads();
+    if (warp == 0) {
+        uint64_t w = lane < blockDim.x / 32 ? warp_sums[lane] : 0;
+        uint64_t wi = w;
+#pragma unroll
+        for (uint32_t d = 1; d < 32; d <<= 1) {
+            const uint64_t o = __shfl_up_sync(0xffffffffu, wi, d);
+            if (lane >= d) wi += o;
+        }
+        if (lane < blockDim.x / 32) warp_sums[lane] = wi - w;  // exclusive warp prefix
+        if (lane == 31) warp_sums[32] = wi;                     // block total
+    }
+    __syncthreads();
+    total = warp_sums[32];
+    const uint64_t result = warp_sums[warp] + incl - v;
+    __syncthreads();
+    return result;
+}
+
+extern "C" __global__ void __launch_bounds__(kScanBlock)
+presst_scan_blocks(const uint32_t* __restrict__ in, uint32_t n, uint64_t* __restrict__ out,
+                   uint64_t* __restrict__ block_sums) {
+    __shared__ uint64_t warp_sums[33];
+    const uint32_t i = blockIdx.x * kScanBlock + threadIdx.x;
+    const uint64_t v = i < n ? in[i] : 0;
+    uint64_t total;
+    const uint64_t excl = block_exclusive_scan(v, warp_sums, total);
+    if (i <= n) out[i] = excl;
+    if (threadIdx.x == 0) block_sums[blockIdx.x] = total;
+}
+
+// One block: exclusive scan of nb block sums in place, total in sums[nb].
+extern "C" __global__ void __launch_bounds__(kScanBlock)
+presst_scan_sums(uint64_t* __restrict__ sums, uint32_t nb) {
+    __shared__ uint64_t warp_sums[33];
+    uint64_t carry = 0;
+    for (uint32_t base = 0; base < nb; base += kScanBlock) {
+        const uint32_t i = base + threadIdx.x;
+        const uint64_t v = i < nb ? sums[i] : 0;
+        uint64_t total;
+        const uint64_t excl = block_exclusive_scan(v, warp_sums, total);
+        if (i < nb) sums[i] = carry + excl;
+        carry += total;
+    }
+    if (threadIdx.x == 0) sums[nb] = carry;
+}
+
+// Adds the block prefixes; optionally writes the result narrowed to u32 too.
+extern "C" __global__ void __launch_bounds__(kScanBlock)
+presst_scan_add(uint64_t* __restrict__ out, uint32_t n, const uint64_t* __restrict__ sums,
+                uint32_t* __restrict__ out32) {
+    const uint32_t i = blockIdx.x * kScanBlock + threadIdx.x;
+    if (i <= n) {
+        const uint64_t v = out[i] + sums[blockIdx.x];
+        out[i] = v;
+        if (out32) out32[i] = static_cast<uint32_t>(v);
     }
 }

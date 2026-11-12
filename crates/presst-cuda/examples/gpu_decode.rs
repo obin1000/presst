@@ -89,6 +89,35 @@ fn strings(dict: &Dictionary, path: &str, runs: usize) -> Result<(), Box<dyn std
         assert_eq!(b.len(), values.len());
     }
     println!("CPU strings encode (1 thread): {:.2} GB/s", gb / best);
+
+    // Device-resident: data uploaded once, results stay on the GPU.
+    let mut data = Vec::with_capacity(bytes);
+    let mut offsets = vec![0u32];
+    for v in &values {
+        data.extend_from_slice(v);
+        offsets.push(data.len() as u32);
+    }
+    let data_dev = gpu.upload_bytes(&data)?;
+    let offsets_dev = gpu.stream().clone_htod(&offsets)?;
+    let mut best = f64::MAX;
+    for _ in 0..runs {
+        let start = Instant::now();
+        let (codes, _) = gpu.encode_strings_device(&table, &data_dev, &offsets_dev, values.len())?;
+        gpu.stream().synchronize()?;
+        best = best.min(start.elapsed().as_secs_f64());
+        assert_eq!(codes.codes_len, batch.codes_len());
+    }
+    println!("GPU strings encode, device-resident: {:.1} GB/s", gb / best);
+    let uploaded = gpu.upload_strings(&table, &batch)?;
+    let mut best = f64::MAX;
+    for _ in 0..runs {
+        let start = Instant::now();
+        let (out, _) = gpu.decode_strings_device(&table, &uploaded, DecodeKernel::WarpShared)?;
+        gpu.stream().synchronize()?;
+        best = best.min(start.elapsed().as_secs_f64());
+        assert_eq!(out.data.len(), bytes);
+    }
+    println!("GPU strings decode, device-resident: {:.1} GB/s", gb / best);
     for kernel in [DecodeKernel::WarpShared, DecodeKernel::WarpGlobal] {
         let mut best_kernel = f64::MAX;
         let mut best_total = f64::MAX;
@@ -118,6 +147,7 @@ fn strings(dict: &Dictionary, path: &str, runs: usize) -> Result<(), Box<dyn std
     Ok(())
 }
 
+#[expect(clippy::too_many_lines, reason = "a linear benchmark script")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 2 {
@@ -181,6 +211,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(f.len(), frame.len());
     }
     println!("CPU encode (1 thread): {:.2} GB/s", gb / best);
+
+    // Device-resident: data uploaded once, results stay on the GPU.
+    let input_dev = gpu.upload_bytes(&input)?;
+    let mut best = f64::MAX;
+    for _ in 0..runs {
+        let start = Instant::now();
+        let (f, _) = gpu.encode_frame_device(&table, &input_dev, options)?;
+        gpu.stream().synchronize()?;
+        best = best.min(start.elapsed().as_secs_f64());
+        assert_eq!(f.len(), frame.len());
+    }
+    println!("GPU encode, device-resident: {:.1} GB/s", gb / best);
+    let uploaded = gpu.upload_frame(&frame)?;
+    let mut best = f64::MAX;
+    for _ in 0..runs {
+        let start = Instant::now();
+        let (out, _) = gpu.decode_frame_device(&table, &uploaded, DecodeKernel::WarpShared)?;
+        gpu.stream().synchronize()?;
+        best = best.min(start.elapsed().as_secs_f64());
+        assert_eq!(out.len(), input.len());
+    }
+    println!("GPU decode, device-resident: {:.1} GB/s", gb / best);
     for placement in DecodeKernel::ALL {
         let mut best_kernel = f64::MAX;
         let mut best_total = f64::MAX;

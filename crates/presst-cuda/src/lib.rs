@@ -25,6 +25,7 @@
 //! driver at run time, [`is_available`] returns false and [`GpuContext::new`]
 //! fails with [`GpuError::Unavailable`].
 
+mod device;
 mod encode;
 mod split;
 
@@ -41,6 +42,7 @@ use presst::{
 };
 use xxhash_rust::xxh3::xxh3_64;
 
+pub use device::{DEVICE_SLACK, DeviceBytes, DeviceCodes, DeviceFrame, DeviceStringBatch, DeviceStrings};
 pub use split::{GpuSplit, frame_splits};
 
 /// The compiled kernels (empty if nvcc was not available at build time).
@@ -168,6 +170,10 @@ pub struct GpuContext {
     encode: CudaFunction,
     encode_tiled: CudaFunction,
     gather: CudaFunction,
+    string_ranges: CudaFunction,
+    scan_blocks: CudaFunction,
+    scan_sums: CudaFunction,
+    scan_add: CudaFunction,
 }
 
 impl fmt::Debug for GpuContext {
@@ -217,6 +223,13 @@ fn decode_table_bytes(dict: &Dictionary) -> Vec<u8> {
     out
 }
 
+/// Plain integer types whose every bit pattern is valid, so device memory of
+/// them can be allocated without initializing it.
+pub(crate) trait PlainInt: cudarc::driver::DeviceRepr {}
+impl PlainInt for u8 {}
+impl PlainInt for u32 {}
+impl PlainInt for u64 {}
+
 /// Timing of one GPU operation.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct GpuTiming {
@@ -244,6 +257,10 @@ impl GpuContext {
                 .collect::<std::result::Result<_, _>>()?,
             encode: module.load_function("presst_encode_ranges")?,
             encode_tiled: module.load_function("presst_encode_ranges_tiled")?,
+            string_ranges: module.load_function("presst_string_ranges")?,
+            scan_blocks: module.load_function("presst_scan_blocks")?,
+            scan_sums: module.load_function("presst_scan_sums")?,
+            scan_add: module.load_function("presst_scan_add")?,
             gather: module.load_function("presst_gather")?,
             strings_shared: module.load_function("presst_decode_strings_shared")?,
             strings_global: module.load_function("presst_decode_strings_global")?,
@@ -303,7 +320,7 @@ impl GpuContext {
         let input = self.stream.clone_htod(frame)?;
         let splits_dev = self.stream.clone_htod(&split::to_bytes(&splits))?;
         // 8 bytes of slack: the kernel writes whole aligned words.
-        let mut out = self.stream.alloc_zeros::<u8>(index.content_size + 8)?;
+        let mut out = self.alloc_uninit::<u8>(index.content_size + 8)?;
         let timing = self.launch_decode(dict, &input, &splits_dev, splits.len(), &mut out, kernel)?;
         let mut content = self.stream.clone_dtoh(&out)?;
         content.truncate(index.content_size);
@@ -409,8 +426,8 @@ impl GpuContext {
         let codes = self.stream.clone_htod(batch.code_bytes())?;
         let code_offsets = self.stream.clone_htod(batch.offsets())?;
         let groups_dev = self.stream.clone_htod(&split::to_bytes(&groups))?;
-        let mut out = self.stream.alloc_zeros::<u8>(total as usize + 16)?;
-        let mut out_offsets = self.stream.alloc_zeros::<u32>(n + 1)?;
+        let mut out = self.alloc_uninit::<u8>(total as usize + 16)?;
+        let mut out_offsets = self.alloc_uninit::<u32>(n + 1)?;
         let mut error = self.stream.alloc_zeros::<u32>(1)?;
         let n_groups = groups.len() as u32;
         let n_strings = n as u32;
@@ -572,8 +589,8 @@ impl GpuContext {
         padded.resize(input.len() + slack, 0);
         let input_dev = self.stream.clone_htod(&padded)?;
         let ranges_dev = self.stream.clone_htod(&encode::ranges_to_bytes(&ranges))?;
-        let mut scratch = self.stream.alloc_zeros::<u8>(scratch_len as usize + 8)?;
-        let mut lens_dev = self.stream.alloc_zeros::<u32>(pieces.len())?;
+        let mut scratch = self.alloc_uninit::<u8>(scratch_len as usize + 8)?;
+        let mut lens_dev = self.alloc_uninit::<u32>(pieces.len())?;
         let mut launch = self
             .stream
             .launch_builder(if tiled { &self.encode_tiled } else { &self.encode });
@@ -605,7 +622,7 @@ impl GpuContext {
             total += u64::from(l);
         }
         let dst_offsets_dev = self.stream.clone_htod(&dst_offsets)?;
-        let mut dst = self.stream.alloc_zeros::<u8>(total as usize + 1)?;
+        let mut dst = self.alloc_uninit::<u8>(total as usize + 1)?;
         let mut gather = self.stream.launch_builder(&self.gather);
         gather
             .arg(&scratch)
@@ -633,6 +650,17 @@ impl GpuContext {
             kernel_ms += start.elapsed_ms(&end)?;
         }
         Ok((codes, lens, GpuTiming { kernel_ms }))
+    }
+
+    /// Allocates device memory without zeroing it. Used for buffers that the
+    /// kernels overwrite before anything reads them (outputs, scratch areas,
+    /// lengths, offsets); never for error words.
+    pub(crate) fn alloc_uninit<T: PlainInt>(&self, len: usize) -> Result<CudaSlice<T>> {
+        // SAFETY: `T` is a plain integer type, for which any bit pattern is a
+        // valid value, so reading memory that no kernel wrote yields arbitrary
+        // values but no undefined behaviour. The callers only hand out elements
+        // that the kernels write.
+        Ok(unsafe { self.stream.alloc::<T>(len.max(1)) }?)
     }
 
     /// The stream all work is queued on.

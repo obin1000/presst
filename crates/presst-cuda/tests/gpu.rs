@@ -252,3 +252,79 @@ fn gpu_encode_large_frame() {
         );
     }
 }
+
+// --- device-resident API ------------------------------------------------------
+
+fn device_options() -> impl Strategy<Value = FrameOptions> {
+    (10u8..=12, 8u8..=11, any::<bool>()).prop_map(|(block, split, content_size)| FrameOptions {
+        block_size_log2: block,
+        split_size_log2: Some(split),
+        checksum: false,
+        content_size,
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: cases() / 3 + 1, ..ProptestConfig::default() })]
+
+    #[test]
+    fn device_frames_match_cpu((dict, input) in dict_and_input(), opts in device_options()) {
+        let Some(gpu) = gpu() else { return Ok(()) };
+        let table = gpu.upload(&dict).unwrap();
+        let expected = Compressor::new(&dict).unwrap().compress_with(&input, opts);
+        // Encode from device input to a device frame.
+        let input_dev = gpu.upload_bytes(&input).unwrap();
+        let (frame_dev, _) = gpu.encode_frame_device(&table, &input_dev, opts).unwrap();
+        let frame = gpu.download_bytes(&frame_dev).unwrap();
+        prop_assert_eq!(&frame, &expected);
+        // Decode a device frame into device memory.
+        let uploaded = gpu.upload_frame(&frame).unwrap();
+        for kernel in DecodeKernel::ALL {
+            let (out, _) = gpu.decode_frame_device(&table, &uploaded, kernel).unwrap();
+            prop_assert_eq!(&gpu.download_bytes(&out).unwrap(), &input);
+        }
+    }
+
+    #[test]
+    fn device_strings_match_cpu((dict, strings) in dict_and_strings(), indexed: bool) {
+        let Some(gpu) = gpu() else { return Ok(()) };
+        let table = gpu.upload(&dict).unwrap();
+        let comp = Compressor::new(&dict).unwrap();
+        // Encode device strings (Arrow layout) to device codes.
+        let mut data = Vec::new();
+        let mut offsets = vec![0u32];
+        for s in &strings {
+            data.extend_from_slice(s);
+            offsets.push(data.len() as u32);
+        }
+        let data_dev = gpu.upload_bytes(&data).unwrap();
+        let offsets_dev = gpu.stream().clone_htod(&offsets).unwrap();
+        let (codes, _) = gpu.encode_strings_device(&table, &data_dev, &offsets_dev, strings.len()).unwrap();
+        prop_assert_eq!(gpu.download_codes(&table, &codes).unwrap(), comp.compress_strings(&strings));
+        // Decode a batch into device strings.
+        let batch = comp.compress_strings_with(&strings, StringOptions { decoded_index: indexed });
+        let (expected_data, expected_offsets) = Decompressor::new(&dict).unwrap().decompress_strings(&batch).unwrap();
+        let uploaded = gpu.upload_strings(&table, &batch).unwrap();
+        let (out, _) = gpu.decode_strings_device(&table, &uploaded, DecodeKernel::default()).unwrap();
+        prop_assert_eq!(gpu.download_bytes(&out.data).unwrap(), expected_data);
+        prop_assert_eq!(gpu.stream().clone_dtoh(&out.offsets).unwrap(), expected_offsets);
+    }
+}
+
+#[test]
+fn device_rejects_bad_offsets() {
+    let Some(gpu) = gpu() else { return };
+    let dict = Dictionary::from_symbols(Scheme::U8, [&b"ab"[..]]).unwrap();
+    let table = gpu.upload(&dict).unwrap();
+    let data = gpu.upload_bytes(b"abab").unwrap();
+    for offsets in [vec![0u32, 3, 2], vec![0u32, 2, 1000]] {
+        let offsets_dev = gpu.stream().clone_htod(&offsets).unwrap();
+        assert!(gpu.encode_strings_device(&table, &data, &offsets_dev, 2).is_err());
+    }
+    let input = gpu.upload_bytes(b"abab").unwrap();
+    // Checksums and frames without a split index are not supported on the device.
+    assert!(
+        gpu.encode_frame_device(&table, &input, FrameOptions::default())
+            .is_err()
+    );
+}
