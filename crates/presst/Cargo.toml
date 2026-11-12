@@ -1,0 +1,32 @@
+[package]
+name = "presst"
+description = "PREtrained Static Symbol Table compression: FSST-style string compression with offline-trained dictionaries"
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = ["std"]
+## Standard library support: `std::io` frame reader/writer and `std::error::Error` conversions.
+std = []
+## Compress and decompress frame blocks in parallel with rayon.
+parallel = ["std", "dep:rayon"]
+
+[dependencies]
+xxhash-rust = { workspace = true }
+rayon = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true

@@ -1,0 +1,77 @@
+[workspace]
+resolver = "3"
+exclude = ["fuzz"]
+members = [
+    "crates/presst",
+    "crates/presst-train",
+    "crates/presst-cli",
+    "crates/presst-bench",
+    "xtask",
+]
+default-members = ["crates/presst", "crates/presst-train", "crates/presst-cli"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/obin1000/presst"
+homepage = "https://github.com/obin1000/presst"
+keywords = ["compression", "fsst", "string", "dictionary", "symbol-table"]
+categories = ["compression", "encoding", "no-std"]
+
+[workspace.dependencies]
+presst = { path = "crates/presst", version = "0.0.1", default-features = false }
+presst-train = { path = "crates/presst-train", version = "0.0.1" }
+
+xxhash-rust = { version = "0.8", default-features = false, features = ["xxh3"] }
+rayon = "1.10"
+rand = { version = "0.9", default-features = false }
+rand_chacha = { version = "0.9", default-features = false }
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# dev / bench
+proptest = "1.5"
+divan = "0.1"
+lz4_flex = "0.11"
+zstd = { version = "0.13", features = ["zdict_builder"] }
+fsst-rs = "0.5"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+# Codec code converts between integer widths constantly; the casts are checked by tests.
+cast_possible_truncation = "allow"
+cast_lossless = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+module_name_repetitions = "allow"
+# Every fallible API returns `presst::Error`, whose variants are documented there.
+missing_errors_doc = "allow"
+# Ratios and throughput are reported as floats.
+cast_precision_loss = "allow"
+similar_names = "allow"
+many_single_char_names = "allow"
+inline_always = "allow"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+inherits = "release"
+debug = 1
+
+[profile.profiling]
+inherits = "release"
+debug = 1

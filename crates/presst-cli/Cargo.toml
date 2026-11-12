@@ -1,0 +1,27 @@
+[package]
+name = "presst-cli"
+description = "Command-line tool for presst: train dictionaries, compress and decompress"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories = ["compression", "command-line-utilities"]
+
+[[bin]]
+name = "presst"
+path = "src/main.rs"
+
+[dependencies]
+presst = { workspace = true, features = ["std"] }
+presst-train = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
