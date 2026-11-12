@@ -83,6 +83,66 @@ pub fn frame_splits(index: &FrameIndex) -> Vec<GpuSplit> {
     out
 }
 
+/// Strings per group in the string kernels (one warp).
+const GROUP: usize = 1 << presst::STRING_GROUP_SIZE_LOG2;
+
+/// The decoded start of every group of 32 strings plus the total, computed from
+/// the code streams and the symbol lengths (for batches without a decoded
+/// index). Rejects codes that are not in the dictionary and escapes at the end
+/// of a string, like the CPU decoder.
+pub(crate) fn group_starts(batch: &presst::StringBatch, lens: &[u8; 256]) -> Result<Vec<u64>, presst::Error> {
+    let n = batch.len();
+    let mut starts = Vec::with_capacity(n.div_ceil(GROUP) + 1);
+    let mut total = 0u64;
+    for i in 0..n {
+        if i % GROUP == 0 {
+            starts.push(total);
+        }
+        let codes = batch
+            .codes(i)
+            .ok_or(presst::Error::Corrupt("string index out of range"))?;
+        let mut k = 0;
+        while k < codes.len() {
+            let c = codes[k];
+            if c == 255 {
+                if k + 1 == codes.len() {
+                    return Err(presst::Error::Corrupt("escape at the end of a string"));
+                }
+                total += 1;
+                k += 2;
+            } else {
+                let l = lens[c as usize];
+                if l == 0 {
+                    return Err(presst::Error::Corrupt("code not in the dictionary"));
+                }
+                total += u64::from(l);
+                k += 1;
+            }
+        }
+    }
+    starts.push(total);
+    Ok(starts)
+}
+
+/// One unit of work per group of 32 strings: its codes and decoded range.
+pub(crate) fn string_groups(batch: &presst::StringBatch, starts: &[u64]) -> Vec<GpuSplit> {
+    let offsets = batch.offsets();
+    let n = batch.len();
+    (0..n.div_ceil(GROUP))
+        .map(|g| {
+            let first = g * GROUP;
+            let last = (first + GROUP).min(n);
+            GpuSplit {
+                in_start: u64::from(offsets[first]),
+                out_start: starts[g],
+                in_len: offsets[last] - offsets[first],
+                out_len: (starts[g + 1] - starts[g]) as u32,
+                raw: false,
+            }
+        })
+        .collect()
+}
+
 /// Serializes splits in the kernel's layout (`u64, u64, u32, u32, u32, u32`).
 pub(crate) fn to_bytes(splits: &[GpuSplit]) -> Vec<u8> {
     let mut out = Vec::with_capacity(splits.len() * SPLIT_BYTES);

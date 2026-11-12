@@ -35,7 +35,7 @@ use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::Ptx;
-use presst::{DictId, Dictionary, FrameIndex, Scheme};
+use presst::{DictId, Dictionary, FrameIndex, STRING_GROUP_SIZE_LOG2, Scheme, StringBatch};
 use xxhash_rust::xxh3::xxh3_64;
 
 pub use split::{GpuSplit, frame_splits};
@@ -85,6 +85,9 @@ impl From<presst::Error> for GpuError {
         Self::Format(e)
     }
 }
+
+/// Decoded strings: the concatenated bytes and `len + 1` offsets into them.
+pub type DecodedStrings = (Vec<u8>, Vec<u32>);
 
 /// Result type of the GPU backend.
 pub type Result<T, E = GpuError> = std::result::Result<T, E>;
@@ -156,6 +159,9 @@ pub struct GpuContext {
     _module: Arc<CudaModule>,
     /// Indexed like [`DecodeKernel::ALL`].
     decode: Vec<CudaFunction>,
+    /// String batch kernels: table in shared memory, through L1.
+    strings_shared: CudaFunction,
+    strings_global: CudaFunction,
 }
 
 impl fmt::Debug for GpuContext {
@@ -171,6 +177,8 @@ impl fmt::Debug for GpuContext {
 pub struct GpuDictionary {
     id: DictId,
     table: CudaSlice<u8>,
+    /// Symbol lengths, for computing decoded sizes on the host.
+    lens: [u8; 256],
 }
 
 impl GpuDictionary {
@@ -225,6 +233,8 @@ impl GpuContext {
                 .iter()
                 .map(|k| module.load_function(k.symbol()))
                 .collect::<std::result::Result<_, _>>()?,
+            strings_shared: module.load_function("presst_decode_strings_shared")?,
+            strings_global: module.load_function("presst_decode_strings_global")?,
             _module: module,
             stream,
             ctx,
@@ -241,7 +251,12 @@ impl GpuContext {
         if dict.scheme() != Scheme::U8 {
             return Err(GpuError::Unavailable("only the U8 scheme is supported on the GPU"));
         }
+        let mut lens = [0u8; 256];
+        for (l, &n) in lens.iter_mut().zip(dict.symbol_lens()) {
+            *l = n;
+        }
         Ok(GpuDictionary {
+            lens,
             id: dict.id(),
             table: self.stream.clone_htod(&decode_table_bytes(dict))?,
         })
@@ -333,6 +348,99 @@ impl GpuContext {
             return Err(GpuError::Corrupt(error));
         }
         Ok(GpuTiming { kernel_ms })
+    }
+
+    /// Decompresses every string of a batch held in host memory. Returns the
+    /// concatenated strings and `len + 1` offsets into them (Arrow layout), like
+    /// [`presst::Decompressor::decompress_strings`].
+    ///
+    /// One warp decodes each group of 32 strings. Batches with a decoded index
+    /// (format version 2, [`presst::StringOptions::decoded_index`]) are used as
+    /// they are; for other batches the group starts are computed on the host
+    /// first. Only the table placement of `kernel` matters here.
+    pub fn decompress_strings(
+        &self,
+        dict: &GpuDictionary,
+        batch: &StringBatch,
+        kernel: DecodeKernel,
+    ) -> Result<DecodedStrings> {
+        Ok(self.decompress_strings_timed(dict, batch, kernel)?.0)
+    }
+
+    /// Like [`decompress_strings`](Self::decompress_strings), also returning
+    /// the kernel time.
+    pub fn decompress_strings_timed(
+        &self,
+        dict: &GpuDictionary,
+        batch: &StringBatch,
+        kernel: DecodeKernel,
+    ) -> Result<(DecodedStrings, GpuTiming)> {
+        if batch.dict_id() != dict.id {
+            return Err(GpuError::Format(presst::Error::DictionaryMismatch {
+                expected: batch.dict_id(),
+                actual: dict.id,
+            }));
+        }
+        let n = batch.len();
+        let starts = match batch.decoded_index() {
+            Some((g, starts)) if g == STRING_GROUP_SIZE_LOG2 => starts.to_vec(),
+            _ => split::group_starts(batch, &dict.lens)?,
+        };
+        let total = *starts.last().unwrap_or(&0);
+        let total = u32::try_from(total).map_err(|_| GpuError::Unavailable("decoded batch larger than 4 GiB"))?;
+        let groups = split::string_groups(batch, &starts);
+        if groups.is_empty() {
+            return Ok(((Vec::new(), vec![0; n + 1]), GpuTiming::default()));
+        }
+        let codes = self.stream.clone_htod(batch.code_bytes())?;
+        let code_offsets = self.stream.clone_htod(batch.offsets())?;
+        let groups_dev = self.stream.clone_htod(&split::to_bytes(&groups))?;
+        let mut out = self.stream.alloc_zeros::<u8>(total as usize + 16)?;
+        let mut out_offsets = self.stream.alloc_zeros::<u32>(n + 1)?;
+        let mut error = self.stream.alloc_zeros::<u32>(1)?;
+        let n_groups = groups.len() as u32;
+        let n_strings = n as u32;
+        let func = match kernel {
+            DecodeKernel::ThreadShared | DecodeKernel::WarpShared => &self.strings_shared,
+            DecodeKernel::ThreadGlobal | DecodeKernel::WarpGlobal => &self.strings_global,
+        };
+        let cfg = LaunchConfig {
+            grid_dim: (n_groups.div_ceil(DECODE_THREADS / 32), 1, 1),
+            block_dim: (DECODE_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = self.stream.launch_builder(func);
+        launch
+            .arg(&codes)
+            .arg(&groups_dev)
+            .arg(&n_groups)
+            .arg(&dict.table)
+            .arg(&mut out)
+            .arg(&mut error)
+            .arg(&code_offsets)
+            .arg(&n_strings)
+            .arg(&mut out_offsets)
+            .record_kernel_launch(CUevent_flags::CU_EVENT_DEFAULT);
+        // SAFETY: the arguments match the kernel signature. Groups come from the
+        // batch's validated code offsets and the (validated or host-computed)
+        // group starts: their code ranges lie inside `codes`, their output ranges
+        // inside `out` (total + 16 bytes), and the kernel bounds every group by its
+        // decoded size. `out_offsets` has n + 1 entries; group i writes entries
+        // 32i .. 32i + 31 of at most n.
+        let events = unsafe { launch.launch(cfg) }?;
+        let kernel_ms = match events {
+            Some((start, end)) => start.elapsed_ms(&end)?,
+            None => 0.0,
+        };
+        let error = self.stream.clone_dtoh(&error)?[0];
+        if error != 0 {
+            return Err(GpuError::Corrupt(error));
+        }
+        let mut data = self.stream.clone_dtoh(&out)?;
+        data.truncate(total as usize);
+        let mut offsets = self.stream.clone_dtoh(&out_offsets)?;
+        offsets[n] = total;
+        Ok(((data, offsets), GpuTiming { kernel_ms }))
     }
 
     /// The stream all work is queued on.

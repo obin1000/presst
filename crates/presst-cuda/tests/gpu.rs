@@ -3,7 +3,9 @@
 
 use std::sync::OnceLock;
 
-use presst::{Compressor, Decompressor, Dictionary, DictionaryBuilder, FrameOptions, Scheme};
+use presst::{
+    Compressor, Decompressor, Dictionary, DictionaryBuilder, FrameOptions, Scheme, StringBatch, StringOptions,
+};
 use presst_cuda::{DecodeKernel, GpuContext, GpuError};
 use proptest::prelude::*;
 
@@ -17,6 +19,14 @@ fn gpu() -> Option<&'static GpuContext> {
         Some(GpuContext::new(0).expect("open GPU 0"))
     })
     .as_ref()
+}
+
+/// Cases per property: 300, or `PROPTEST_CASES` for longer runs.
+fn cases() -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300)
 }
 
 fn alphabet_byte() -> impl Strategy<Value = u8> {
@@ -64,7 +74,7 @@ fn options() -> impl Strategy<Value = FrameOptions> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 300, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: cases(), ..ProptestConfig::default() })]
 
     #[test]
     fn gpu_decode_matches_cpu((dict, input) in dict_and_input(), opts in options()) {
@@ -129,4 +139,65 @@ fn large_frame_and_errors() {
         gpu.decompress_frame(&other, &frame, DecodeKernel::default()),
         Err(GpuError::Format(presst::Error::DictionaryMismatch { .. }))
     ));
+}
+
+fn dict_and_strings() -> impl Strategy<Value = (Dictionary, Vec<Vec<u8>>)> {
+    dictionary().prop_flat_map(|d| {
+        let syms: Vec<Vec<u8>> = d.symbols().map(<[u8]>::to_vec).collect();
+        let piece = if syms.is_empty() {
+            prop::collection::vec(alphabet_byte(), 1..4).boxed()
+        } else {
+            prop_oneof![3 => prop::sample::select(syms), 1 => prop::collection::vec(alphabet_byte(), 1..4)].boxed()
+        };
+        let string = prop::collection::vec(piece, 0..12).prop_map(|p| p.concat());
+        (Just(d), prop::collection::vec(string, 0..300))
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: cases(), ..ProptestConfig::default() })]
+
+    #[test]
+    fn gpu_strings_match_cpu((dict, strings) in dict_and_strings(), indexed: bool) {
+        let Some(gpu) = gpu() else { return Ok(()) };
+        let batch = Compressor::new(&dict)
+            .unwrap()
+            .compress_strings_with(&strings, StringOptions { decoded_index: indexed });
+        let expected = Decompressor::new(&dict).unwrap().decompress_strings(&batch).unwrap();
+        let table = gpu.upload(&dict).unwrap();
+        for kernel in [DecodeKernel::WarpShared, DecodeKernel::WarpGlobal] {
+            prop_assert_eq!(&gpu.decompress_strings(&table, &batch, kernel).unwrap(), &expected);
+        }
+    }
+
+    #[test]
+    fn gpu_strings_reject_what_cpu_rejects(
+        (dict, strings) in dict_and_strings(),
+        indexed: bool,
+        flips in prop::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 1..4),
+    ) {
+        let Some(gpu) = gpu() else { return Ok(()) };
+        let batch = Compressor::new(&dict)
+            .unwrap()
+            .compress_strings_with(&strings, StringOptions { decoded_index: indexed });
+        let mut codes = batch.code_bytes().to_vec();
+        if codes.is_empty() {
+            return Ok(());
+        }
+        for (idx, x) in flips {
+            let i = idx.index(codes.len());
+            codes[i] ^= x;
+        }
+        let mut bad = StringBatch::new(batch.dict_id(), codes, batch.offsets().to_vec()).unwrap();
+        if let Some((g, starts)) = batch.decoded_index() {
+            bad = bad.with_decoded_index(g, starts.to_vec()).unwrap();
+        }
+        let cpu = Decompressor::new(&dict).unwrap().decompress_strings(&bad);
+        let table = gpu.upload(&dict).unwrap();
+        let out = gpu.decompress_strings(&table, &bad, DecodeKernel::default());
+        match cpu {
+            Ok(expected) => prop_assert_eq!(out.unwrap(), expected),
+            Err(_) => prop_assert!(out.is_err()),
+        }
+    }
 }

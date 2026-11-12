@@ -145,26 +145,52 @@ __device__ __forceinline__ uint32_t compose(uint32_t g, uint32_t f) {
     return apply_map(g, f & 1u) | (apply_map(g, (f >> 1) & 1u) << 1);
 }
 
-template <bool kSharedTable>
-__device__ __forceinline__ uint32_t decode_split_warp(const uint8_t* __restrict__ in,
+// String context for decode_range_warp (string batches): lane i owns string
+// first + i of the group and records where it starts in the output.
+struct StringGroup {
+    const uint32_t* code_offsets;  // the batch's n+1 code offsets
+    uint32_t first;                // first string of the group
+    uint32_t count;                // strings in the group (<= 32)
+    uint32_t* out_offsets;         // decoded offsets of the strings
+};
+
+// Decodes the range `s` with one warp. `s.out_start` may be unaligned: the
+// first partial 16-byte chunk and the tail are written byte by byte, everything
+// else as aligned 16-byte stores. With kStrings, also writes the decoded offset
+// of every string of `g` and rejects escapes that cross string boundaries.
+template <bool kSharedTable, bool kStrings>
+__device__ __forceinline__ uint32_t decode_range_warp(const uint8_t* __restrict__ in,
                                                       const Split& s,
                                                       const uint64_t* __restrict__ sym,
                                                       const uint8_t* __restrict__ len,
                                                       uint8_t* __restrict__ out,
-                                                      uint8_t* __restrict__ stage) {
+                                                      uint8_t* __restrict__ stage,
+                                                      const StringGroup& g) {
     const uint32_t lane = threadIdx.x & (kWarp - 1);
-    uint8_t* dst = out + s.out_start;
     if (s.raw) {
+        uint8_t* dst = out + s.out_start;
         for (uint32_t i = lane; i < s.in_len; i += kWarp) dst[i] = __ldg(in + s.in_start + i);
         return 0;
     }
     const uint8_t* p = in + s.in_start;
     const uint32_t n = s.in_len;
-    uint32_t fill = 0;      // staged bytes not yet written (< 16 between steps)
-    uint32_t written = 0;   // bytes written to dst (a multiple of 16)
+    // Output goes out in aligned 16-byte chunks from dst; the first `skip` bytes
+    // of the first chunk are not ours.
+    uint32_t skip = static_cast<uint32_t>(s.out_start & 15);
+    uint8_t* dst = out + (s.out_start - skip);
+    uint32_t fill = skip;   // staged bytes (the first `skip` are placeholders)
+    uint32_t written = 0;   // bytes drained from dst (a multiple of 16)
     uint32_t produced = 0;  // bytes decoded so far
     uint32_t carry = 0;     // whether the next step starts with a literal
     uint32_t error = 0;
+
+    // Strings: the relative code index where the string of this lane starts.
+    bool pending = false;
+    uint32_t str_code = 0;
+    if (kStrings && lane < g.count) {
+        pending = true;
+        str_code = __ldg(g.code_offsets + g.first + lane) - __ldg(g.code_offsets + g.first);
+    }
 
     for (uint32_t base = 0; base < n; base += kCodesPerStep) {
         const uint32_t idx = base + lane * kCodesPerLane;
@@ -173,7 +199,7 @@ __device__ __forceinline__ uint32_t decode_split_warp(const uint8_t* __restrict_
 #pragma unroll
         for (uint32_t k = 0; k < kCodesPerLane; ++k) c[k] = k < valid ? __ldg(p + idx + k) : 0u;
 
-        // This lane's carry map over its codes.
+        // The carry map of this lane over its codes.
         uint32_t map = 0;
 #pragma unroll
         for (uint32_t x = 0; x < 2; ++x) {
@@ -194,10 +220,11 @@ __device__ __forceinline__ uint32_t decode_split_warp(const uint8_t* __restrict_
         uint32_t lit = lane == 0 ? carry : apply_map(prev, carry);
         carry = apply_map(__shfl_sync(0xffffffffu, map, kWarp - 1), carry);
 
-        // Decoded lengths and bytes of this lane's codes.
+        // Decoded lengths and bytes of the codes of this lane.
         uint64_t bytes[kCodesPerLane];
         uint32_t lens[kCodesPerLane];
         uint32_t total = 0;
+        uint32_t litmask = 0;
 #pragma unroll
         for (uint32_t k = 0; k < kCodesPerLane; ++k) {
             uint32_t l = 0;
@@ -207,6 +234,7 @@ __device__ __forceinline__ uint32_t decode_split_warp(const uint8_t* __restrict_
                     l = 1;
                     b = c[k];
                     lit = 0;
+                    litmask |= 1u << k;
                 } else if (c[k] == 255u) {
                     lit = 1;
                 } else {
@@ -228,13 +256,32 @@ __device__ __forceinline__ uint32_t decode_split_warp(const uint8_t* __restrict_
             uint32_t v = __shfl_up_sync(0xffffffffu, incl, d);
             if (lane >= d) incl += v;
         }
+        const uint32_t excl = incl - total;
         const uint32_t step_total = __shfl_sync(0xffffffffu, incl, kWarp - 1);
         if (produced + step_total > s.out_len) error |= ERR_OVERFLOW;
+
+        if (kStrings) {
+            // Where does the first code of my string land? Ask the lane holding it.
+            const bool here = pending && str_code < base + kCodesPerStep;
+            const uint32_t rel = here ? str_code - base : 0;
+            const uint32_t packed = excl | (lens[0] << 11) | (lens[1] << 15) | (lens[2] << 19) |
+                                    (lens[3] << 23) | (litmask << 27);
+            const uint32_t v = __shfl_sync(0xffffffffu, packed, rel / kCodesPerLane);
+            if (here) {
+                const uint32_t k = rel % kCodesPerLane;
+                uint32_t pos = v & 0x7ffu;
+                for (uint32_t j = 0; j < k; ++j) pos += (v >> (11 + 4 * j)) & 0xfu;
+                // A literal at a string start means an escape crossed strings.
+                if ((v >> (27 + k)) & 1u) error |= ERR_TRUNCATED;
+                g.out_offsets[g.first + lane] = static_cast<uint32_t>(s.out_start + produced + pos);
+                pending = false;
+            }
+        }
         error = warp_or(error);
         if (error) break;
 
-        // Stage this step's bytes.
-        uint32_t pos = fill + incl - total;
+        // Stage the bytes of this step.
+        uint32_t pos = fill + excl;
 #pragma unroll
         for (uint32_t k = 0; k < kCodesPerLane; ++k) {
             for (uint32_t b = 0; b < lens[k]; ++b) stage[pos++] = static_cast<uint8_t>(bytes[k] >> (8 * b));
@@ -245,9 +292,15 @@ __device__ __forceinline__ uint32_t decode_split_warp(const uint8_t* __restrict_
 
         // Drain whole 16-byte chunks; keep the remainder at the start of the stage.
         const uint32_t chunks = fill / 16;
+        uint32_t j0 = 0;
+        if (skip && chunks) {
+            if (lane >= skip && lane < 16) dst[written + lane] = stage[lane];
+            j0 = 1;
+            skip = 0;
+        }
         uint4* gdst = reinterpret_cast<uint4*>(dst + written);
         const uint4* sstage = reinterpret_cast<const uint4*>(stage);
-        for (uint32_t j = lane; j < chunks; j += kWarp) gdst[j] = sstage[j];
+        for (uint32_t j = j0 + lane; j < chunks; j += kWarp) gdst[j] = sstage[j];
         const uint32_t rem = fill - chunks * 16;
         uint8_t keep = lane < rem ? stage[chunks * 16 + lane] : 0;
         __syncwarp();
@@ -257,7 +310,9 @@ __device__ __forceinline__ uint32_t decode_split_warp(const uint8_t* __restrict_
         fill = rem;
     }
     if (!error && produced != s.out_len) error = ERR_UNDERFLOW;
-    if (!error && lane < fill) dst[written + lane] = stage[lane];
+    if (!error && lane < fill && lane >= skip) dst[written + lane] = stage[lane];
+    // Strings that start after the last code (empty strings at the end).
+    if (kStrings && !error && pending) g.out_offsets[g.first + lane] = static_cast<uint32_t>(s.out_start + produced);
     return error;
 }
 
