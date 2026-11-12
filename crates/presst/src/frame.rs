@@ -84,15 +84,23 @@ impl Default for FrameOptions {
 }
 
 impl FrameOptions {
-    pub(crate) fn block_size_log2(self) -> u8 {
+    /// The block size that is written, as a power of two (the field, clamped
+    /// to the allowed range).
+    #[must_use]
+    pub fn block_size_log2(self) -> u8 {
         self.block_size_log2.clamp(MIN_BLOCK_SIZE_LOG2, MAX_BLOCK_SIZE_LOG2)
     }
 
-    pub(crate) fn block_size(self) -> usize {
+    /// The block size that is written, in bytes.
+    #[must_use]
+    pub fn block_size(self) -> usize {
         1 << self.block_size_log2()
     }
 
-    pub(crate) fn split_size_log2(self) -> Option<u8> {
+    /// The split size that is written, as a power of two (the field, clamped
+    /// to the allowed range), if any.
+    #[must_use]
+    pub fn split_size_log2(self) -> Option<u8> {
         self.split_size_log2
             .map(|s| s.clamp(MIN_SPLIT_SIZE_LOG2, self.block_size_log2()))
     }
@@ -176,7 +184,9 @@ impl FrameHeader {
         })
     }
 
-    pub(crate) fn write(&self, out: &mut Vec<u8>) {
+    /// Appends the serialized header to `out`. For writers that assemble
+    /// frames themselves (for example on a GPU); see [`block_header`].
+    pub fn write(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&FRAME_MAGIC);
         out.push(if self.split_size_log2.is_some() {
             FRAME_VERSION_SPLIT
@@ -218,6 +228,20 @@ impl FrameHeader {
     }
 }
 
+/// The 8-byte header of a block whose payload is `csize` bytes and decodes to
+/// `dsize` bytes. For writers that assemble frames themselves: such a writer
+/// must follow the rules in `docs/FORMAT.md` (block sizes, raw fallback, split
+/// index) to produce frames identical to [`Compressor::compress_with`].
+#[must_use]
+pub fn block_header(raw: bool, last: bool, csize: usize, dsize: usize) -> [u8; BLOCK_HEADER_LEN] {
+    let kind = if raw { BLOCK_RAW } else { BLOCK_CODED };
+    let word = csize as u32 | if last { BLOCK_LAST } else { 0 } | (kind << BLOCK_TYPE_SHIFT);
+    let mut out = [0u8; BLOCK_HEADER_LEN];
+    out[..4].copy_from_slice(&word.to_le_bytes());
+    out[4..].copy_from_slice(&(dsize as u32).to_le_bytes());
+    out
+}
+
 /// Appends one block (header + payload) for `chunk` to `out`. Falls back to a
 /// raw block when coding does not save space.
 pub(crate) fn write_block(comp: &Compressor, chunk: &[u8], last: bool, split_size: Option<usize>, out: &mut Vec<u8>) {
@@ -241,17 +265,13 @@ pub(crate) fn write_block(comp: &Compressor, chunk: &[u8], last: bool, split_siz
             }
         }
     }
-    let kind = if out.len() - payload_pos >= chunk.len() {
+    let raw = out.len() - payload_pos >= chunk.len();
+    if raw {
         out.truncate(payload_pos);
         out.extend_from_slice(chunk);
-        BLOCK_RAW
-    } else {
-        BLOCK_CODED
-    };
+    }
     let csize = out.len() - payload_pos;
-    let word = csize as u32 | if last { BLOCK_LAST } else { 0 } | (kind << BLOCK_TYPE_SHIFT);
-    out[header_pos..header_pos + 4].copy_from_slice(&word.to_le_bytes());
-    out[header_pos + 4..header_pos + 8].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
+    out[header_pos..header_pos + BLOCK_HEADER_LEN].copy_from_slice(&block_header(raw, last, csize, chunk.len()));
 }
 
 pub(crate) fn compress_frame(comp: &Compressor, input: &[u8], options: FrameOptions, out: &mut Vec<u8>) {

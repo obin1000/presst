@@ -201,3 +201,54 @@ proptest! {
         }
     }
 }
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: cases(), ..ProptestConfig::default() })]
+
+    #[test]
+    fn gpu_encode_matches_cpu((dict, input) in dict_and_input(), opts in options()) {
+        let Some(gpu) = gpu() else { return Ok(()) };
+        let expected = Compressor::new(&dict).unwrap().compress_with(&input, opts);
+        let table = gpu.upload(&dict).unwrap();
+        prop_assert_eq!(gpu.compress_frame(&table, &input, opts).unwrap(), expected);
+    }
+
+    #[test]
+    fn gpu_encode_strings_matches_cpu((dict, strings) in dict_and_strings(), indexed: bool) {
+        let Some(gpu) = gpu() else { return Ok(()) };
+        let options = StringOptions { decoded_index: indexed };
+        let expected = Compressor::new(&dict).unwrap().compress_strings_with(&strings, options);
+        let table = gpu.upload(&dict).unwrap();
+        prop_assert_eq!(gpu.compress_strings(&table, &strings, options).unwrap(), expected);
+    }
+}
+
+#[test]
+fn gpu_encode_large_frame() {
+    let Some(gpu) = gpu() else { return };
+    let dict = Dictionary::from_symbols(
+        Scheme::U8,
+        [&b"lorem "[..], b"ipsum ", b"dolor ", b"sit ", b"amet", b", ", b"co"],
+    )
+    .unwrap()
+    .to_fsst_order();
+    let input: Vec<u8> = b"lorem ipsum dolor sit amet, consectetur \xff\x00 "
+        .iter()
+        .copied()
+        .cycle()
+        .take(3_000_000)
+        .collect();
+    let table = gpu.upload(&dict).unwrap();
+    for split in [None, Some(12)] {
+        let opts = FrameOptions {
+            split_size_log2: split,
+            ..FrameOptions::default()
+        };
+        let frame = gpu.compress_frame(&table, &input, opts).unwrap();
+        assert_eq!(frame, Compressor::new(&dict).unwrap().compress_with(&input, opts));
+        assert_eq!(
+            gpu.decompress_frame(&table, &frame, DecodeKernel::default()).unwrap(),
+            input
+        );
+    }
+}

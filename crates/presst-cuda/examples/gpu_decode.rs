@@ -65,6 +65,30 @@ fn strings(dict: &Dictionary, path: &str, runs: usize) -> Result<(), Box<dyn std
     let gpu = GpuContext::new(0)?;
     println!("GPU: {}", gpu.device_name()?);
     let table = gpu.upload(dict)?;
+    let options = StringOptions { decoded_index: true };
+    let mut best_kernel = f64::MAX;
+    let mut best_total = f64::MAX;
+    for _ in 0..runs {
+        let start = Instant::now();
+        let (gpu_batch, timing) = gpu.compress_strings_timed(&table, &values, options)?;
+        best_total = best_total.min(start.elapsed().as_secs_f64());
+        best_kernel = best_kernel.min(f64::from(timing.kernel_ms) / 1e3);
+        assert_eq!(gpu_batch, batch);
+    }
+    println!(
+        "GPU strings encode: kernel {:.1} GB/s, end-to-end {:.2} GB/s",
+        gb / best_kernel,
+        gb / best_total
+    );
+    let comp = Compressor::new(dict)?;
+    let mut best = f64::MAX;
+    for _ in 0..runs.min(5) {
+        let start = Instant::now();
+        let b = comp.compress_strings_with(&values, options);
+        best = best.min(start.elapsed().as_secs_f64());
+        assert_eq!(b.len(), values.len());
+    }
+    println!("CPU strings encode (1 thread): {:.2} GB/s", gb / best);
     for kernel in [DecodeKernel::WarpShared, DecodeKernel::WarpGlobal] {
         let mut best_kernel = f64::MAX;
         let mut best_total = f64::MAX;
@@ -129,6 +153,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gpu = GpuContext::new(0)?;
     println!("GPU: {}", gpu.device_name()?);
     let table = gpu.upload(&dict)?;
+    let options = FrameOptions {
+        split_size_log2: Some(split),
+        checksum: false,
+        ..FrameOptions::default()
+    };
+    let mut best_kernel = f64::MAX;
+    let mut best_total = f64::MAX;
+    for _ in 0..runs {
+        let start = Instant::now();
+        let (gpu_frame, timing) = gpu.compress_frame_timed(&table, &input, options)?;
+        best_total = best_total.min(start.elapsed().as_secs_f64());
+        best_kernel = best_kernel.min(f64::from(timing.kernel_ms) / 1e3);
+        assert_eq!(gpu_frame, frame);
+    }
+    println!(
+        "GPU encode: kernel {:.1} GB/s, end-to-end {:.2} GB/s",
+        gb / best_kernel,
+        gb / best_total
+    );
+    let comp = Compressor::new(&dict)?;
+    let mut best = f64::MAX;
+    for _ in 0..runs.min(5) {
+        let start = Instant::now();
+        let f = comp.compress_with(&input, options);
+        best = best.min(start.elapsed().as_secs_f64());
+        assert_eq!(f.len(), frame.len());
+    }
+    println!("CPU encode (1 thread): {:.2} GB/s", gb / best);
     for placement in DecodeKernel::ALL {
         let mut best_kernel = f64::MAX;
         let mut best_total = f64::MAX;

@@ -25,6 +25,7 @@
 //! driver at run time, [`is_available`] returns false and [`GpuContext::new`]
 //! fails with [`GpuError::Unavailable`].
 
+mod encode;
 mod split;
 
 use std::fmt;
@@ -35,7 +36,9 @@ use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::Ptx;
-use presst::{DictId, Dictionary, FrameIndex, STRING_GROUP_SIZE_LOG2, Scheme, StringBatch};
+use presst::{
+    DictId, Dictionary, FrameIndex, FrameOptions, STRING_GROUP_SIZE_LOG2, Scheme, StringBatch, StringOptions,
+};
 use xxhash_rust::xxh3::xxh3_64;
 
 pub use split::{GpuSplit, frame_splits};
@@ -162,6 +165,8 @@ pub struct GpuContext {
     /// String batch kernels: table in shared memory, through L1.
     strings_shared: CudaFunction,
     strings_global: CudaFunction,
+    encode: CudaFunction,
+    gather: CudaFunction,
 }
 
 impl fmt::Debug for GpuContext {
@@ -179,6 +184,9 @@ pub struct GpuDictionary {
     table: CudaSlice<u8>,
     /// Symbol lengths, for computing decoded sizes on the host.
     lens: [u8; 256],
+    /// The encode tables (`EncodeTable` in `kernels/presst_encode.cuh`).
+    encode: CudaSlice<u8>,
+    dict: Dictionary,
 }
 
 impl GpuDictionary {
@@ -233,6 +241,8 @@ impl GpuContext {
                 .iter()
                 .map(|k| module.load_function(k.symbol()))
                 .collect::<std::result::Result<_, _>>()?,
+            encode: module.load_function("presst_encode_ranges")?,
+            gather: module.load_function("presst_gather")?,
             strings_shared: module.load_function("presst_decode_strings_shared")?,
             strings_global: module.load_function("presst_decode_strings_global")?,
             _module: module,
@@ -257,6 +267,8 @@ impl GpuContext {
         }
         Ok(GpuDictionary {
             lens,
+            encode: self.stream.clone_htod(&encode::encode_table_bytes(dict))?,
+            dict: dict.clone(),
             id: dict.id(),
             table: self.stream.clone_htod(&decode_table_bytes(dict))?,
         })
@@ -441,6 +453,160 @@ impl GpuContext {
         let mut offsets = self.stream.clone_dtoh(&out_offsets)?;
         offsets[n] = total;
         Ok(((data, offsets), GpuTiming { kernel_ms }))
+    }
+
+    /// Compresses `input` into a frame on the GPU. The result is byte-identical
+    /// to [`presst::Compressor::compress_with`] with the same options.
+    ///
+    /// Splits (format version 2) or, without a split index, whole blocks are
+    /// encoded by one GPU thread each, so use a split index for speed.
+    pub fn compress_frame(&self, dict: &GpuDictionary, input: &[u8], options: FrameOptions) -> Result<Vec<u8>> {
+        Ok(self.compress_frame_timed(dict, input, options)?.0)
+    }
+
+    /// Like [`compress_frame`](Self::compress_frame), also returning the
+    /// kernel time (encode plus compaction).
+    pub fn compress_frame_timed(
+        &self,
+        dict: &GpuDictionary,
+        input: &[u8],
+        options: FrameOptions,
+    ) -> Result<(Vec<u8>, GpuTiming)> {
+        let plan = encode::plan_frame(input.len(), options);
+        let (codes, lens, timing) = self.encode_pieces(dict, input, &plan.pieces)?;
+        Ok((encode::assemble_frame(&plan, &dict.dict, input, &codes, &lens), timing))
+    }
+
+    /// Compresses strings into a batch on the GPU, one thread per string. The
+    /// result equals [`presst::Compressor::compress_strings_with`].
+    pub fn compress_strings<S: AsRef<[u8]>>(
+        &self,
+        dict: &GpuDictionary,
+        strings: &[S],
+        options: StringOptions,
+    ) -> Result<StringBatch> {
+        Ok(self.compress_strings_timed(dict, strings, options)?.0)
+    }
+
+    /// Like [`compress_strings`](Self::compress_strings), also returning the
+    /// kernel time.
+    pub fn compress_strings_timed<S: AsRef<[u8]>>(
+        &self,
+        dict: &GpuDictionary,
+        strings: &[S],
+        options: StringOptions,
+    ) -> Result<(StringBatch, GpuTiming)> {
+        let total: usize = strings.iter().map(|s| s.as_ref().len()).sum();
+        let mut input = Vec::with_capacity(total);
+        let mut pieces = Vec::with_capacity(strings.len());
+        for s in strings {
+            let s = s.as_ref();
+            let len = u32::try_from(s.len()).map_err(|_| GpuError::Unavailable("string larger than 4 GiB"))?;
+            pieces.push((input.len() as u64, len));
+            input.extend_from_slice(s);
+        }
+        let (codes, lens, timing) = self.encode_pieces(dict, &input, &pieces)?;
+        let mut offsets = Vec::with_capacity(strings.len() + 1);
+        let mut end = 0u32;
+        offsets.push(0);
+        for &l in &lens {
+            end = end
+                .checked_add(l)
+                .ok_or(GpuError::Unavailable("string batch larger than 4 GiB"))?;
+            offsets.push(end);
+        }
+        let mut batch = StringBatch::new(dict.id, codes, offsets)?;
+        if options.decoded_index {
+            let group = 1usize << STRING_GROUP_SIZE_LOG2;
+            let mut starts = Vec::with_capacity(strings.len().div_ceil(group) + 1);
+            let mut pos = 0u64;
+            for (i, s) in strings.iter().enumerate() {
+                if i % group == 0 {
+                    starts.push(pos);
+                }
+                pos += s.as_ref().len() as u64;
+            }
+            starts.push(pos);
+            batch = batch.with_decoded_index(STRING_GROUP_SIZE_LOG2, starts)?;
+        }
+        Ok((batch, timing))
+    }
+
+    /// Encodes consecutive pieces of `input` on the GPU. Returns the codes of
+    /// all pieces back to back and the code length of each.
+    fn encode_pieces(
+        &self,
+        dict: &GpuDictionary,
+        input: &[u8],
+        pieces: &[(u64, u32)],
+    ) -> Result<(Vec<u8>, Vec<u32>, GpuTiming)> {
+        if pieces.is_empty() {
+            return Ok((Vec::new(), Vec::new(), GpuTiming::default()));
+        }
+        let n = u32::try_from(pieces.len()).map_err(|_| GpuError::Unavailable("too many pieces for one launch"))?;
+        let (ranges, scratch_len) = encode::ranges(pieces.iter().copied());
+        // 16 bytes of slack: the kernel reads 8-byte windows past the end.
+        let mut padded = Vec::with_capacity(input.len() + 16);
+        padded.extend_from_slice(input);
+        padded.resize(input.len() + 16, 0);
+        let input_dev = self.stream.clone_htod(&padded)?;
+        let ranges_dev = self.stream.clone_htod(&encode::ranges_to_bytes(&ranges))?;
+        let mut scratch = self.stream.alloc_zeros::<u8>(scratch_len as usize + 8)?;
+        let mut lens_dev = self.stream.alloc_zeros::<u32>(pieces.len())?;
+        let mut launch = self.stream.launch_builder(&self.encode);
+        launch
+            .arg(&input_dev)
+            .arg(&ranges_dev)
+            .arg(&n)
+            .arg(&dict.encode)
+            .arg(&mut scratch)
+            .arg(&mut lens_dev)
+            .record_kernel_launch(CUevent_flags::CU_EVENT_DEFAULT);
+        let cfg = LaunchConfig {
+            grid_dim: (n.div_ceil(DECODE_THREADS), 1, 1),
+            block_dim: (DECODE_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the arguments match `presst_encode_ranges`. Every range reads
+        // inside `input_dev` (the input plus 16 bytes of slack for 8-byte
+        // windows) and writes at most 2 * in_len code bytes, rounded up to 8,
+        // inside its own scratch slot (`encode::ranges` reserves that much, plus 8
+        // bytes of slack at the end).
+        let encode_events = unsafe { launch.launch(cfg) }?;
+        let lens = self.stream.clone_dtoh(&lens_dev)?;
+        let mut dst_offsets = Vec::with_capacity(lens.len());
+        let mut total = 0u64;
+        for &l in &lens {
+            dst_offsets.push(total);
+            total += u64::from(l);
+        }
+        let dst_offsets_dev = self.stream.clone_htod(&dst_offsets)?;
+        let mut dst = self.stream.alloc_zeros::<u8>(total as usize + 1)?;
+        let mut gather = self.stream.launch_builder(&self.gather);
+        gather
+            .arg(&scratch)
+            .arg(&ranges_dev)
+            .arg(&lens_dev)
+            .arg(&dst_offsets_dev)
+            .arg(&n)
+            .arg(&mut dst)
+            .record_kernel_launch(CUevent_flags::CU_EVENT_DEFAULT);
+        let cfg = LaunchConfig {
+            grid_dim: (n.div_ceil(DECODE_THREADS / 32), 1, 1),
+            block_dim: (DECODE_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: the arguments match `presst_gather`. Range i copies lens[i]
+        // bytes from its scratch slot to dst_offsets[i]; the offsets are the
+        // prefix sums of the lengths, so every copy lies inside `dst` (total + 1).
+        let gather_events = unsafe { gather.launch(cfg) }?;
+        let mut codes = self.stream.clone_dtoh(&dst)?;
+        codes.truncate(total as usize);
+        let mut kernel_ms = 0.0;
+        for (start, end) in [encode_events, gather_events].into_iter().flatten() {
+            kernel_ms += start.elapsed_ms(&end)?;
+        }
+        Ok((codes, lens, GpuTiming { kernel_ms }))
     }
 
     /// The stream all work is queued on.

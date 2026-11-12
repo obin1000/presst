@@ -101,3 +101,55 @@ presst_decode_splits_global(const uint8_t* __restrict__ in,
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Encoding.
+#include "presst_encode.cuh"
+
+// One thread per range, encode tables in shared memory. Writes the code length
+// of every range to out_lens.
+extern "C" __global__ void __launch_bounds__(256)
+presst_encode_ranges(const uint8_t* __restrict__ in,
+                     const Range* __restrict__ ranges,
+                     uint32_t n_ranges,
+                     const EncodeTable* __restrict__ table,
+                     uint8_t* __restrict__ out,
+                     uint32_t* __restrict__ out_lens) {
+    __shared__ uint64_t long_sym[kLongSlots];
+    __shared__ uint8_t long_len[kLongSlots];
+    __shared__ uint8_t long_code[kLongSlots];
+    __shared__ uint32_t two[kTwoSlots];
+    __shared__ uint8_t byte_code[256];
+    for (uint32_t i = threadIdx.x; i < kLongSlots; i += blockDim.x) {
+        long_sym[i] = table->long_sym[i];
+        long_len[i] = table->long_len[i];
+        long_code[i] = table->long_code[i];
+    }
+    for (uint32_t i = threadIdx.x; i < kTwoSlots; i += blockDim.x) two[i] = table->two[i];
+    for (uint32_t i = threadIdx.x; i < 256; i += blockDim.x) byte_code[i] = table->byte_code[i];
+    __syncthreads();
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_ranges; i += gridDim.x * blockDim.x) {
+        Range r = ranges[i];
+        out_lens[i] = encode_range(in, r, long_sym, long_len, long_code, two, byte_code, out);
+    }
+}
+
+// Compaction: one warp per range copies its codes from the scratch area to
+// dst[dst_offsets[i] ..].
+extern "C" __global__ void __launch_bounds__(256)
+presst_gather(const uint8_t* __restrict__ scratch,
+              const Range* __restrict__ ranges,
+              const uint32_t* __restrict__ lens,
+              const uint64_t* __restrict__ dst_offsets,
+              uint32_t n_ranges,
+              uint8_t* __restrict__ dst) {
+    const uint32_t warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    const uint32_t lane = threadIdx.x % 32;
+    const uint32_t warps = gridDim.x * blockDim.x / 32;
+    for (uint32_t i = warp; i < n_ranges; i += warps) {
+        const uint8_t* src = scratch + ranges[i].out_start;
+        uint8_t* d = dst + dst_offsets[i];
+        const uint32_t n = lens[i];
+        for (uint32_t j = lane; j < n; j += 32) d[j] = src[j];
+    }
+}
