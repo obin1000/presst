@@ -5,7 +5,7 @@
 //! `<out>/<id>.pdict` plus `<out>/manifest.json`:
 //!
 //! ```json
-//! {"format": 1, "columns": {"<table>.<column>": "<16 hex digit id>"}, "training": {...}}
+//! {"format": 1, "columns": {"<table>.<column>": "<16 hex digit id>"}, "training": {...}, "positions": {...}}
 //! ```
 //!
 //! `columns` is the contract with the engine integrations (Vortex, DuckDB);
@@ -19,6 +19,9 @@
 //! The table name is the file stem without a trailing `_<number>` (so
 //! `lineitem_0.parquet` and `lineitem_1.parquet` are both `lineitem`), or the
 //! value of `--table`.
+//!
+//! `<out>/duckdb.manifest` repeats the mapping as `table<TAB>position<TAB>id` lines for the
+//! DuckDB fork, whose storage layer knows column positions but not names.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -48,6 +51,11 @@ pub struct Manifest {
     /// `table.column` -> what the dictionary was trained on.
     #[serde(default)]
     pub training: BTreeMap<String, Training>,
+    /// `table.column` -> 0-based position of the column in its Parquet file. Engines that only
+    /// know column positions (DuckDB's storage layer) use this; tables loaded from these files
+    /// keep the order.
+    #[serde(default)]
+    pub positions: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -155,8 +163,16 @@ fn is_string(field: &Type) -> bool {
         && info.converted_type() != ConvertedType::DECIMAL
 }
 
-/// table -> column -> (values, source files).
-type Values = BTreeMap<String, BTreeMap<String, (Vec<Vec<u8>>, Vec<String>)>>;
+/// Values of one column, the files they came from, and the column's position in the file.
+#[derive(Default)]
+struct ColumnValues {
+    values: Vec<Vec<u8>>,
+    sources: Vec<String>,
+    position: usize,
+}
+
+/// table -> column -> values.
+type Values = BTreeMap<String, BTreeMap<String, ColumnValues>>;
 
 fn read_values(files: &[PathBuf], table_override: Option<&str>) -> Result<Values> {
     let mut out: Values = BTreeMap::new();
@@ -172,9 +188,12 @@ fn read_values(files: &[PathBuf], table_override: Option<&str>) -> Result<Values
             continue;
         }
         let columns = out.entry(table).or_default();
-        for f in &fields {
-            let (_, sources) = columns.entry(f.name().to_owned()).or_default();
-            sources.push(file_name.clone());
+        for (position, f) in root.get_fields().iter().enumerate() {
+            if is_string(f) {
+                let column = columns.entry(f.name().to_owned()).or_default();
+                column.sources.push(file_name.clone());
+                column.position = position;
+            }
         }
         let projection = Type::group_type_builder(root.name()).with_fields(fields).build()?;
         for row in reader.get_row_iter(Some(projection))? {
@@ -185,7 +204,7 @@ fn read_values(files: &[PathBuf], table_override: Option<&str>) -> Result<Values
                     _ => continue,
                 };
                 if !v.is_empty() {
-                    columns.get_mut(name).expect("projected column").0.push(v.to_vec());
+                    columns.get_mut(name).expect("projected column").values.push(v.to_vec());
                 }
             }
         }
@@ -217,7 +236,15 @@ pub fn run(args: &[String]) -> Result<()> {
 
     let values = read_values(&files, args.table.as_deref())?;
     for (table, columns) in values {
-        for (column, (vals, sources)) in columns {
+        for (
+            column,
+            ColumnValues {
+                values: vals,
+                sources,
+                position,
+            },
+        ) in columns
+        {
             let key = format!("{table}.{column}");
             let bytes: usize = vals.iter().map(Vec::len).sum();
             if vals.len() < args.min_values {
@@ -252,6 +279,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 report.validation_ratio
             );
             manifest.columns.insert(key.clone(), id);
+            manifest.positions.insert(key.clone(), position);
             manifest.training.insert(
                 key,
                 Training {
@@ -267,8 +295,23 @@ pub fn run(args: &[String]) -> Result<()> {
         }
     }
     std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)? + "\n")?;
+    std::fs::write(args.out.join("duckdb.manifest"), duckdb_manifest(&manifest))?;
     eprintln!("{} dictionaries in {}", manifest.columns.len(), manifest_path.display());
     Ok(())
+}
+
+/// The manifest for the DuckDB fork, which only knows table names and column positions: one
+/// `table<TAB>position<TAB>id` line per column.
+fn duckdb_manifest(m: &Manifest) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from("# presst dictionaries for DuckDB: table<TAB>column position<TAB>dictionary id\n");
+    for (key, id) in &m.columns {
+        let (Some((table, _)), Some(position)) = (key.split_once('.'), m.positions.get(key)) else {
+            continue;
+        };
+        let _ = writeln!(out, "{table}\t{position}\t{id}");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -297,5 +340,7 @@ mod tests {
         // `training` is optional for readers that only need the mapping.
         let minimal: Manifest = serde_json::from_str(r#"{"format":1,"columns":{"t.c":"00"}}"#).unwrap();
         assert_eq!(minimal.columns.len(), 1);
+        m.positions.insert("t.c".into(), 3);
+        assert!(duckdb_manifest(&m).ends_with("t\t3\t0123456789abcdef\n"));
     }
 }
