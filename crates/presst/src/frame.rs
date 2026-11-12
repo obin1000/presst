@@ -133,6 +133,7 @@ impl FrameHeader {
     }
 
     /// Length of the header that starts with these first 16 bytes.
+    #[cfg(feature = "std")]
     pub(crate) fn len_from_prefix(prefix: &[u8; 16]) -> usize {
         let flags = prefix[5];
         16 + if flags & FLAG_CONTENT_SIZE != 0 { 8 } else { 0 } + usize::from(flags & FLAG_SPLIT_INDEX != 0)
